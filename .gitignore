@@ -32,4 +32,4 @@ configs/prompts/3_sparsectrl/notused
 filter_test.py
 train.log
 readme.txt
-README.md
+dontshow.md
