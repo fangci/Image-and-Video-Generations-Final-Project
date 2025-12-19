@@ -287,6 +287,38 @@ class VersatileAttention(CrossAttention):
 
         if self.group_norm is not None:
             hidden_states = self.group_norm(hidden_states.transpose(1, 2)).transpose(1, 2)
+        
+        # ----------------------------------------------------
+        # MODIFIED: Style Anchor Duplication (針對 K/V 序列)
+        # 測試 temporal cosistwncy : DUPLICATION_FACTOR > 1, Otherwise = 0
+        # ----------------------------------------------------
+        
+        # 定義第一幀的重複次數。例如，1 次表示第一幀特徵將出現兩次 (原件 + 副本)。
+        DUPLICATION_FACTOR = 1 # MODIFIED: 增加錨點幀的 Key/Value 貢獻次數
+        ATTENTION_WEIGHT_SCALE = 0.5
+        
+        # 獲取原始的 K/V 輸入序列 (對於 Temporal Self-Attention，即為 hidden_states)
+        original_kv_input = encoder_hidden_states if encoder_hidden_states is not None else hidden_states
+        
+        is_temporal_self_attention = (self.attention_mode == "Temporal" and not self.is_cross_attention)
+
+        if is_temporal_self_attention and DUPLICATION_FACTOR > 0:
+            # 提取第一幀 (f=0) 的特徵
+            # original_kv_input 形狀: (B*D) F C
+            anchor_frame = original_kv_input[:, 0:1, :] # 形狀: (B*D) 1 C
+            
+            # 重複錨點幀
+            anchor_frame_duplicated = anchor_frame.repeat(1, DUPLICATION_FACTOR, 1) # 形狀: (B*D) DUPLICATION_FACTOR C
+            
+            # 構建新的 K/V 序列: [Anchor_Copy, ..., Anchor_Copy, F0, F1, ..., F_last]
+            # 將重複的錨點特徵與原始序列拼接起來
+            kv_input_modified = torch.cat([anchor_frame_duplicated, original_kv_input], dim=1) # MODIFIED
+            kv_input_modified[:, 0:DUPLICATION_FACTOR, :] = kv_input_modified[:, 0:DUPLICATION_FACTOR, :] * ATTENTION_WEIGHT_SCALE
+        else:
+            # Cross-Attention 或不重複時，使用原始輸入
+            kv_input_modified = original_kv_input # MODIFIED
+
+        # ----------------------------------------------------
 
         query = self.to_q(hidden_states)
         dim = query.shape[-1]
@@ -295,19 +327,38 @@ class VersatileAttention(CrossAttention):
         if self.added_kv_proj_dim is not None:
             raise NotImplementedError
 
-        encoder_hidden_states = encoder_hidden_states if encoder_hidden_states is not None else hidden_states
-        key = self.to_k(encoder_hidden_states)
-        value = self.to_v(encoder_hidden_states)
+        # encoder_hidden_states = encoder_hidden_states if encoder_hidden_states is not None else hidden_states
+        # key = self.to_k(encoder_hidden_states)
+        # value = self.to_v(encoder_hidden_states)
+
+        # K/V 使用修改後的序列
+        key = self.to_k(kv_input_modified) # MODIFIED: 使用包含重複錨點的新序列
+        value = self.to_v(kv_input_modified) # MODIFIED: 使用包含重複錨點的新序列
 
         key = self.reshape_heads_to_batch_dim(key)
         value = self.reshape_heads_to_batch_dim(value)
 
-        if attention_mask is not None:
+        if attention_mask is not None and DUPLICATION_FACTOR > 0:
+            # 如果有額外重複幀，attention_mask 長度也需要擴展
+            # 創建一個全為 False (0.0) 的掩碼部分給重複的錨點
+            anchor_mask = torch.zeros((attention_mask.shape[0], DUPLICATION_FACTOR), device=attention_mask.device, dtype=attention_mask.dtype) # MODIFIED
+             
+            # 拼接: [Anchor Mask, Original Mask]
+            attention_mask_modified = torch.cat([anchor_mask, attention_mask], dim=1) # MODIFIED
+             
+             # 重新計算填充 (原碼中的填充邏輯可能因為序列長度變化而失效)
+            if attention_mask_modified.shape[-1] != key.shape[2]: # key.shape[2] 是新的序列長度 (F + N_dups)
+                pad_length = key.shape[2] - attention_mask_modified.shape[-1]
+                attention_mask_modified = F.pad(attention_mask_modified, (0, pad_length), value=0.0)
+                
+            attention_mask = attention_mask_modified.repeat_interleave(self.heads, dim=0) # MODIFIED: 使用修改後的掩碼
+            
+        elif attention_mask is not None:
             if attention_mask.shape[-1] != query.shape[1]:
                 target_length = query.shape[1]
                 attention_mask = F.pad(attention_mask, (0, target_length), value=0.0)
                 attention_mask = attention_mask.repeat_interleave(self.heads, dim=0)
-
+               
         # attention, what we cannot get enough of
         if self._use_memory_efficient_attention_xformers:
             hidden_states = self._memory_efficient_attention_xformers(query, key, value, attention_mask)

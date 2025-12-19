@@ -24,3 +24,12 @@ models/StableDiffusion/*
 !models/DreamBooth_LoRA/*.txt
 !models/MotionLoRA/
 !models/MotionLoRA/*.txt
+
+configs/prompts/1_animate/notused
+configs/prompts/2_motionlora/notused
+configs/prompts/3_sparsectrl/notused
+
+filter_test.py
+train.log
+readme.txt
+README.md

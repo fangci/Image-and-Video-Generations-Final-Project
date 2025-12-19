@@ -1,7 +1,8 @@
 image_finetune: false
 
 output_dir: "outputs"
-pretrained_model_path: "models/StableDiffusion/stable-diffusion-v1-5"
+pretrained_model_path: "runwayml/stable-diffusion-v1-5"
+motion_module_path: "/home/moony/storage/fangci/AnimateDiff/models/Motion_Module/v3_sd15_mm.ckpt"
 
 unet_additional_kwargs:
   use_motion_module              : true
@@ -28,8 +29,8 @@ noise_scheduler_kwargs:
   clip_sample:         false
 
 train_data:
-  csv_path:        "path_to_csv_file"
-  video_folder:    "path_to_video_foler"
+  csv_path:        "/home/moony/storage/fangci/AnimateDiff/webvid_csv/webvid.csv"
+  video_folder:    "/home/ado/storage/nas/webvid/videos"
   sample_size:     256
   sample_stride:   4
   sample_n_frames: 16
@@ -49,10 +50,10 @@ trainable_modules:
 unet_checkpoint_path: ""
 
 learning_rate:    1.e-4
-train_batch_size: 4
+train_batch_size: 2
 
 max_train_epoch:      -1
-max_train_steps:      100
+max_train_steps:      500
 checkpointing_epochs: -1
 checkpointing_steps:  60
 

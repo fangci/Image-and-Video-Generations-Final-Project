@@ -90,6 +90,7 @@ def main(
     cfg_random_null_text_ratio: float = 0.1,
     
     unet_checkpoint_path: str = "",
+    motion_module_path: str = "",
     unet_additional_kwargs: Dict = {},
     ema_decay: float = 0.9999,
     noise_scheduler_kwargs = None,
@@ -176,14 +177,35 @@ def main(
         
     # Load pretrained unet weights
     if unet_checkpoint_path != "":
-        zero_rank_print(f"from checkpoint: {unet_checkpoint_path}")
+        print(f"from checkpoint: {unet_checkpoint_path}")
         unet_checkpoint_path = torch.load(unet_checkpoint_path, map_location="cpu")
         if "global_step" in unet_checkpoint_path: zero_rank_print(f"global_step: {unet_checkpoint_path['global_step']}")
         state_dict = unet_checkpoint_path["state_dict"] if "state_dict" in unet_checkpoint_path else unet_checkpoint_path
 
+        new_state_dict = {}
+        for k, v in state_dict.items():
+            if k.startswith('module.'):
+                # 移除 'module.' 前綴
+                new_state_dict[k[7:]] = v
+            else:
+                new_state_dict[k] = v
+        
+        state_dict = new_state_dict
+        
         m, u = unet.load_state_dict(state_dict, strict=False)
-        zero_rank_print(f"missing keys: {len(m)}, unexpected keys: {len(u)}")
-        assert len(u) == 0
+        print(f"missing keys: {len(m)}, unexpected keys: {len(u)}")
+        # assert len(u) == 0
+        
+    # 【MODIFIED】: 載入 Motion Module 專用 Checkpoint
+    if motion_module_path != "":
+        print(f"Loading Motion Module weights from: {motion_module_path}")
+        
+        motion_ckpt = torch.load(motion_module_path, map_location="cpu")
+        motion_state_dict = motion_ckpt["state_dict"] if "state_dict" in motion_ckpt else motion_ckpt
+        
+        m, u = unet.load_state_dict(motion_state_dict, strict=False)
+        
+        print(f"Motion Module Load (Override): missing keys: {len(m)}, unexpected keys: {len(u)}, total keys: {len(motion_state_dict)}")
         
     # Freeze vae and text_encoder
     vae.requires_grad_(False)

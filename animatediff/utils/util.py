@@ -109,6 +109,14 @@ def load_weights(
         print(f"load motion module from {motion_module_path}")
         motion_module_state_dict = torch.load(motion_module_path, map_location="cpu")
         motion_module_state_dict = motion_module_state_dict["state_dict"] if "state_dict" in motion_module_state_dict else motion_module_state_dict
+        new_state_dict = {}
+        for k, v in motion_module_state_dict.items():
+            if k.startswith('module.'):
+                # 移除 'module.' 前綴
+                new_state_dict[k[7:]] = v
+            else:
+                new_state_dict[k] = v
+        motion_module_state_dict = new_state_dict
         # filter parameters
         for name, param in motion_module_state_dict.items():
             if not "motion_modules." in name: continue
@@ -117,7 +125,8 @@ def load_weights(
         unet_state_dict.pop("animatediff_config", "")
     
     missing, unexpected = animation_pipeline.unet.load_state_dict(unet_state_dict, strict=False)
-    assert len(unexpected) == 0
+    print(f"Motion Module Load: missing keys: {len(missing)}, unexpected keys: {len(unexpected)}, total keys: {len(unet_state_dict)}")
+    # assert len(unexpected) == 0
     del unet_state_dict
 
     # base model

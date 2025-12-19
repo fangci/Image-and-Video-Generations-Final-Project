@@ -339,6 +339,11 @@ class AnimationPipeline(DiffusionPipeline):
         controlnet_image_index: list = [0],
         controlnet_conditioning_scale: Union[float, List[float]] = 1.0,
 
+        # --- 新增參數 ---
+        latents_mask: Optional[torch.FloatTensor] = None, # 遮罩: 1代表要動, 0代表不動
+        reference_latents: Optional[torch.FloatTensor] = None, # 參考幀或原始影片的 latents
+        # ----------------
+
         **kwargs,
     ):
         # Default height and width to unet
@@ -396,40 +401,75 @@ class AnimationPipeline(DiffusionPipeline):
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
+                
+                # background masking
+                if latents_mask is not None and reference_latents is not None:
+                    mask = latents_mask.to(latents.device, latents.dtype)
+                    ref  = reference_latents.to(latents.device, latents.dtype)
+
+                    ref_noisy = self.scheduler.add_noise(
+                        ref,
+                        noise=torch.randn_like(ref),
+                        timesteps=t
+                    )
+
+                    latents = latents * mask + ref_noisy * (1 - mask)
+                    
                 # expand the latents if we are doing classifier free guidance
                 latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
                 latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
 
                 down_block_additional_residuals = mid_block_additional_residual = None
                 if (getattr(self, "controlnet", None) != None) and (controlnet_images != None):
-                    assert controlnet_images.dim() == 5
+                    # assert controlnet_images.dim() == 5
 
+                    # sparsectrl improvement
                     controlnet_noisy_latents = latent_model_input
                     controlnet_prompt_embeds = text_embeddings
 
-                    controlnet_images = controlnet_images.to(latents.device)
+                    controlnet_images_1 = controlnet_images[0].to(latents.device)
+                    controlnet_images_2 = controlnet_images[1].to(latents.device)
+                    
+                    def run_controlnet(controlnet_images):
 
-                    controlnet_cond_shape    = list(controlnet_images.shape)
-                    controlnet_cond_shape[2] = video_length
-                    controlnet_cond = torch.zeros(controlnet_cond_shape).to(latents.device)
+                        controlnet_cond_shape    = list(controlnet_images.shape)
+                        controlnet_cond_shape[2] = video_length
+                        controlnet_cond = torch.zeros(controlnet_cond_shape).to(latents.device)
 
-                    controlnet_conditioning_mask_shape    = list(controlnet_cond.shape)
-                    controlnet_conditioning_mask_shape[1] = 1
-                    controlnet_conditioning_mask          = torch.zeros(controlnet_conditioning_mask_shape).to(latents.device)
+                        controlnet_conditioning_mask_shape    = list(controlnet_cond.shape)
+                        controlnet_conditioning_mask_shape[1] = 1
+                        controlnet_conditioning_mask          = torch.zeros(controlnet_conditioning_mask_shape).to(latents.device)
 
-                    assert controlnet_images.shape[2] >= len(controlnet_image_index)
-                    controlnet_cond[:,:,controlnet_image_index] = controlnet_images[:,:,:len(controlnet_image_index)]
-                    controlnet_conditioning_mask[:,:,controlnet_image_index] = 1
+                        assert controlnet_images.shape[2] >= len(controlnet_image_index)
+                        controlnet_cond[:,:,controlnet_image_index] = controlnet_images[:,:,:len(controlnet_image_index)]
+                        controlnet_conditioning_mask[:,:,controlnet_image_index] = 1
 
-                    down_block_additional_residuals, mid_block_additional_residual = self.controlnet(
-                        controlnet_noisy_latents, t,
-                        encoder_hidden_states=controlnet_prompt_embeds,
-                        controlnet_cond=controlnet_cond,
-                        conditioning_mask=controlnet_conditioning_mask,
-                        conditioning_scale=controlnet_conditioning_scale,
-                        guess_mode=False, return_dict=False,
-                    )
+                        down_block_additional_residuals, mid_block_additional_residual = self.controlnet(
+                            controlnet_noisy_latents, t,
+                            encoder_hidden_states=controlnet_prompt_embeds,
+                            controlnet_cond=controlnet_cond,
+                            conditioning_mask=controlnet_conditioning_mask,
+                            conditioning_scale=controlnet_conditioning_scale,
+                            guess_mode=False, return_dict=False,
+                        )
+                        
+                        return down_block_additional_residuals, mid_block_additional_residual   
 
+                    down_block_additional_residuals_1, mid_block_additional_residual_1 = run_controlnet(controlnet_images_1)
+                    down_block_additional_residuals_2, mid_block_additional_residual_2 = run_controlnet(controlnet_images_2)
+                    
+                    # with augmented sketch
+                    progress = (i / len(timesteps)) ** 0.5
+                    w1 = 1.0 - progress
+                    w2 = 1.0 - w1
+                    
+                    # without augmented sketch
+                    # w1 = 1.0
+                    # w2 = 0.0
+                    
+                    down_block_additional_residuals = [db1 * w1 + db2 * w2 for db1, db2 in zip(down_block_additional_residuals_1, down_block_additional_residuals_2)]
+                    mid_block_additional_residual   = mid_block_additional_residual_1 * w1 + mid_block_additional_residual_2 * w2
+                    
                 # predict the noise residual
                 noise_pred = self.unet(
                     latent_model_input, t, 
@@ -445,6 +485,25 @@ class AnimationPipeline(DiffusionPipeline):
 
                 # compute the previous noisy sample x_t -> x_t-1
                 latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs).prev_sample
+
+                # # ----------------------------------------------------
+                # # 實作 Latent Mask Blending   ###如果只用這段不加unet前那段會讓first frame和其他frame畫風割裂###
+                # # ----------------------------------------------------
+                # if latents_mask is not None and reference_latents is not None:
+                #     # 確保 mask 與 latents 裝置一致
+                #     mask = latents_mask.to(latents.device, dtype=latents.dtype)
+                #     ref = reference_latents.to(latents.device, dtype=latents.dtype)
+                    
+                #     noise = torch.randn_like(ref)
+                #     ref_noisy = self.scheduler.add_noise(ref, noise, t)
+                    
+                #     step_ratio = t / self.scheduler.config.num_train_timesteps
+                #     # 在前期 (step_ratio 接近 1.0) 減少背景強制混合的強度，允許模型產生光影過渡
+                #     # 在後期 (step_ratio 接近 0.0) 完全鎖定背景以維持穩定
+                #     blend_factor = 1.0 - step_ratio 
+                #     latents = (ref_noisy * (1 - latents_mask) + latents * latents_mask) * blend_factor + \
+                #             latents * (1 - blend_factor)
+                # # ----------------------------------------------------
 
                 # call the callback, if provided
                 if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):

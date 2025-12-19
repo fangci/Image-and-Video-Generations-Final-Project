@@ -112,12 +112,72 @@ def main(args):
                 controlnet_images = rearrange(controlnet_images, "b c f h w -> (b f) c h w")
                 controlnet_images = vae.encode(controlnet_images * 2. - 1.).latent_dist.sample() * 0.18215
                 controlnet_images = rearrange(controlnet_images, "(b f) c h w -> b c f h w", f=num_controlnet_images)
+                
+            controlnet_images_list = []
+
+            for path in image_paths:
+                img = image_norm(image_transforms(Image.open(path).convert("RGB")))
+                img = img.unsqueeze(0).unsqueeze(2).cuda()  # [1, C, 1, H, W]
+                controlnet_images_list.append(img)
+
+            controlnet_images = controlnet_images_list
+            
+            if controlnet.use_simplified_condition_embedding:
+                new_list = []
+                for img in controlnet_images:
+                    b, c, f, h, w = img.shape
+                    img_ = rearrange(img, "b c f h w -> (b f) c h w")
+                    img_ = vae.encode(img_ * 2. - 1.).latent_dist.sample() * 0.18215
+                    img_ = rearrange(img_, "(b f) c h w -> b c f h w", f=f)
+                    new_list.append(img_)
+                controlnet_images = new_list
 
         # set xformers
         if is_xformers_available() and (not args.without_xformers):
             unet.enable_xformers_memory_efficient_attention()
             if controlnet is not None: controlnet.enable_xformers_memory_efficient_attention()
 
+        mask_path = model_config.get("mask_path", "")
+        latents_mask = None
+
+        if mask_path != "":
+            # 1. 讀取遮罩圖片並轉為灰階 (L)
+            mask_img = Image.open(mask_path).convert("L")
+            
+            # 2. 定義遮罩的 Resize 尺寸 (必須是 Latent 空間大小，即原圖 H/8, W/8)
+            latent_h, latent_w = model_config.H // 8, model_config.W // 8
+            
+            # 3. 轉換與 Resize
+            mask_transforms = transforms.Compose([
+                transforms.Resize((latent_h, latent_w), interpolation=transforms.InterpolationMode.NEAREST),
+                transforms.ToTensor(),
+            ])
+            
+            # 4. 處理後的遮罩張量 [1, 1, latent_h, latent_w]
+            latents_mask = mask_transforms(mask_img).unsqueeze(0)
+            latents_mask = (latents_mask > 0.5).float().cuda()
+            
+            # 5. 擴展到視頻長度 [1, 1, video_length, latent_h, latent_w]
+            latents_mask = repeat(latents_mask, "b c h w -> b c f h w", f=model_config.L)
+
+        reference_latents = None
+        ref_image_path = model_config.get("reference_image_path", "") # 或是用第一張 controlnet 圖
+
+        if ref_image_path != "":
+            ref_img = Image.open(ref_image_path).convert("RGB")
+            ref_transforms = transforms.Compose([
+                transforms.Resize((model_config.H, model_config.W)),
+                transforms.ToTensor(),
+                transforms.Normalize([0.5], [0.5])
+            ])
+            ref_tensor = ref_transforms(ref_img).unsqueeze(0).cuda() # [1, 3, H, W]
+            
+            # 使用 VAE 將參考圖轉為 Latent
+            with torch.no_grad():
+                reference_latents = vae.encode(ref_tensor).latent_dist.sample() * 0.18215
+                # 擴展到視頻長度 [1, 4, video_length, latent_h, latent_w]
+                reference_latents = repeat(reference_latents, "b c h w -> b c f h w", f=model_config.L)
+        
         pipeline = AnimationPipeline(
             vae=vae, text_encoder=text_encoder, tokenizer=tokenizer, unet=unet,
             controlnet=controlnet,
@@ -166,6 +226,11 @@ def main(args):
 
                 controlnet_images = controlnet_images,
                 controlnet_image_index = model_config.get("controlnet_image_indexs", [0]),
+
+                # --- 新增傳遞給 pipeline_animation.py 的參數 ---
+                latents_mask      = latents_mask,
+                reference_latents = reference_latents,
+                # --------------------------------------------
             ).videos
             samples.append(sample)
 
