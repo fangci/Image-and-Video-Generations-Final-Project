@@ -60,133 +60,12 @@ def main(args):
         inference_config = OmegaConf.load(model_config.get("inference_config", args.inference_config))
         unet = UNet3DConditionModel.from_pretrained_2d(args.pretrained_model_path, subfolder="unet", unet_additional_kwargs=OmegaConf.to_container(inference_config.unet_additional_kwargs)).cuda()
 
-<<<<<<< HEAD
-        # load controlnet model
-        controlnet = controlnet_images = None
-        if model_config.get("controlnet_path", "") != "":
-            assert model_config.get("controlnet_images", "") != ""
-            assert model_config.get("controlnet_config", "") != ""
-            
-            unet.config.num_attention_heads = 8
-            unet.config.projection_class_embeddings_input_dim = None
-
-            controlnet_config = OmegaConf.load(model_config.controlnet_config)
-            controlnet = SparseControlNetModel.from_unet(unet, controlnet_additional_kwargs=controlnet_config.get("controlnet_additional_kwargs", {}))
-
-            auto_download(model_config.controlnet_path, is_dreambooth_lora=False)
-            print(f"loading controlnet checkpoint from {model_config.controlnet_path} ...")
-            controlnet_state_dict = torch.load(model_config.controlnet_path, map_location="cpu")
-            controlnet_state_dict = controlnet_state_dict["controlnet"] if "controlnet" in controlnet_state_dict else controlnet_state_dict
-            controlnet_state_dict = {name: param for name, param in controlnet_state_dict.items() if "pos_encoder.pe" not in name}
-            controlnet_state_dict.pop("animatediff_config", "")
-            controlnet.load_state_dict(controlnet_state_dict)
-            controlnet.cuda()
-
-            image_paths = model_config.controlnet_images
-            if isinstance(image_paths, str): image_paths = [image_paths]
-
-            print(f"controlnet image paths:")
-            for path in image_paths: print(path)
-            assert len(image_paths) <= model_config.L
-
-            image_transforms = transforms.Compose([
-                transforms.RandomResizedCrop(
-                    (model_config.H, model_config.W), (1.0, 1.0), 
-                    ratio=(model_config.W/model_config.H, model_config.W/model_config.H)
-                ),
-                transforms.ToTensor(),
-            ])
-
-            if model_config.get("normalize_condition_images", False):
-                def image_norm(image):
-                    image = image.mean(dim=0, keepdim=True).repeat(3,1,1)
-                    image -= image.min()
-                    image /= image.max()
-                    return image
-            else: image_norm = lambda x: x
-                
-            controlnet_images = [image_norm(image_transforms(Image.open(path).convert("RGB"))) for path in image_paths]
-
-            os.makedirs(os.path.join(savedir, "control_images"), exist_ok=True)
-            for i, image in enumerate(controlnet_images):
-                Image.fromarray((255. * (image.numpy().transpose(1,2,0))).astype(np.uint8)).save(f"{savedir}/control_images/{i}.png")
-
-            controlnet_images = torch.stack(controlnet_images).unsqueeze(0).cuda()
-            controlnet_images = rearrange(controlnet_images, "b f c h w -> b c f h w")
-
-            if controlnet.use_simplified_condition_embedding:
-                num_controlnet_images = controlnet_images.shape[2]
-                controlnet_images = rearrange(controlnet_images, "b c f h w -> (b f) c h w")
-                controlnet_images = vae.encode(controlnet_images * 2. - 1.).latent_dist.sample() * 0.18215
-                controlnet_images = rearrange(controlnet_images, "(b f) c h w -> b c f h w", f=num_controlnet_images)
-                
-            controlnet_images_list = []
-
-            for path in image_paths:
-                img = image_norm(image_transforms(Image.open(path).convert("RGB")))
-                img = img.unsqueeze(0).unsqueeze(2).cuda()  # [1, C, 1, H, W]
-                controlnet_images_list.append(img)
-
-            controlnet_images = controlnet_images_list
-            
-            if controlnet.use_simplified_condition_embedding:
-                new_list = []
-                for img in controlnet_images:
-                    b, c, f, h, w = img.shape
-                    img_ = rearrange(img, "b c f h w -> (b f) c h w")
-                    img_ = vae.encode(img_ * 2. - 1.).latent_dist.sample() * 0.18215
-                    img_ = rearrange(img_, "(b f) c h w -> b c f h w", f=f)
-                    new_list.append(img_)
-                controlnet_images = new_list
-=======
         controlnet = None 
->>>>>>> 141b849... First commit
 
         # set xformers
         if is_xformers_available() and (not args.without_xformers):
             unet.enable_xformers_memory_efficient_attention()
 
-        mask_path = model_config.get("mask_path", "")
-        latents_mask = None
-
-        if mask_path != "":
-            # 1. 讀取遮罩圖片並轉為灰階 (L)
-            mask_img = Image.open(mask_path).convert("L")
-            
-            # 2. 定義遮罩的 Resize 尺寸 (必須是 Latent 空間大小，即原圖 H/8, W/8)
-            latent_h, latent_w = model_config.H // 8, model_config.W // 8
-            
-            # 3. 轉換與 Resize
-            mask_transforms = transforms.Compose([
-                transforms.Resize((latent_h, latent_w), interpolation=transforms.InterpolationMode.NEAREST),
-                transforms.ToTensor(),
-            ])
-            
-            # 4. 處理後的遮罩張量 [1, 1, latent_h, latent_w]
-            latents_mask = mask_transforms(mask_img).unsqueeze(0)
-            latents_mask = (latents_mask < 0.5).float().cuda()
-            
-            # 5. 擴展到視頻長度 [1, 1, video_length, latent_h, latent_w]
-            latents_mask = repeat(latents_mask, "b c h w -> b c f h w", f=model_config.L)
-
-        reference_latents = None
-        ref_image_path = model_config.get("reference_image_path", "") # 或是用第一張 controlnet 圖
-
-        if ref_image_path != "":
-            ref_img = Image.open(ref_image_path).convert("RGB")
-            ref_transforms = transforms.Compose([
-                transforms.Resize((model_config.H, model_config.W)),
-                transforms.ToTensor(),
-                transforms.Normalize([0.5], [0.5])
-            ])
-            ref_tensor = ref_transforms(ref_img).unsqueeze(0).cuda() # [1, 3, H, W]
-            
-            # 使用 VAE 將參考圖轉為 Latent
-            with torch.no_grad():
-                reference_latents = vae.encode(ref_tensor).latent_dist.sample() * 0.18215
-                # 擴展到視頻長度 [1, 4, video_length, latent_h, latent_w]
-                reference_latents = repeat(reference_latents, "b c h w -> b c f h w", f=model_config.L)
-        
         pipeline = AnimationPipeline(
             vae=vae, text_encoder=text_encoder, tokenizer=tokenizer, unet=unet,
             controlnet=controlnet,
@@ -236,33 +115,6 @@ def main(args):
                 torch.seed()
                 current_seed = torch.initial_seed()
             
-<<<<<<< HEAD
-            print(f"current seed: {torch.initial_seed()}")
-            print(f"sampling {prompt} ...")
-            # =========================
-            # Pass 1: reference eps
-            # =========================
-            with torch.no_grad():
-                ref_out = pipeline(
-                    prompt,
-                    negative_prompt     = n_prompt,
-                    num_inference_steps = model_config.steps,
-                    guidance_scale      = model_config.guidance_scale,
-                    width               = model_config.W,
-                    height              = model_config.H,
-                    video_length        = model_config.L,
-
-                    controlnet_images       = controlnet_images,
-                    controlnet_image_index  = model_config.get("controlnet_image_indexs", [0]),
-
-                    cache_reference_eps = True,
-                )
-
-            reference_eps = ref_out.reference_eps
-            
-            sample = pipeline(
-                prompt,
-=======
             config[model_idx].random_seed.append(current_seed)
             print(f"Sampling seed: {current_seed}")
 
@@ -274,25 +126,12 @@ def main(args):
             
             draft_output = pipeline(
                 prompt = combined_prompt_str, # 這裡傳入正常的 string
->>>>>>> 141b849... First commit
                 negative_prompt     = n_prompt,
                 num_inference_steps = model_config.steps,
                 guidance_scale      = model_config.guidance_scale,
                 width               = model_config.W,
                 height              = model_config.H,
                 video_length        = model_config.L,
-<<<<<<< HEAD
-
-                controlnet_images = controlnet_images,
-                controlnet_image_index = model_config.get("controlnet_image_indexs", [0]),
-
-                # --- 新增傳遞給 pipeline_animation.py 的參數 ---
-                latents_mask      = latents_mask,
-                reference_latents = reference_latents,
-                reference_eps     = reference_eps,
-                # --------------------------------------------
-=======
->>>>>>> 141b849... First commit
             ).videos
 
             save_videos_grid(draft_output, f"{savedir}/sample/{sample_idx}-1_draft.gif")
