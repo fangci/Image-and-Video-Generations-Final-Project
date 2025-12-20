@@ -26,7 +26,8 @@ from pathlib import Path
 from PIL import Image
 import numpy as np
 
-# 引入 Mask 工具 (請確保 animatediff/utils/mask_util.py 已經建立)
+# 引入 Mask & KV 工具 (請確保 attention.py 已更新)
+from animatediff.models.attention import KVCacheController
 from animatediff.utils.mask_util import AttentionMaskController, AutoMaskGenerator
 
 @torch.no_grad()
@@ -41,12 +42,11 @@ def main(args):
     config  = OmegaConf.load(args.config)
     samples = []
 
-    # 初始化 Mask 工具
+    # 初始化控制器
     mask_controller = AttentionMaskController.get_instance()
-    # 只有在需要 layer separation 時才載入 rembg
+    kv_controller = KVCacheController.get_instance() # [NEW]
     auto_masker = AutoMaskGenerator()
 
-    # create validation pipeline
     tokenizer    = CLIPTokenizer.from_pretrained(args.pretrained_model_path, subfolder="tokenizer")
     text_encoder = CLIPTextModel.from_pretrained(args.pretrained_model_path, subfolder="text_encoder").cuda()
     vae          = AutoencoderKL.from_pretrained(args.pretrained_model_path, subfolder="vae").cuda()
@@ -60,15 +60,12 @@ def main(args):
         inference_config = OmegaConf.load(model_config.get("inference_config", args.inference_config))
         unet = UNet3DConditionModel.from_pretrained_2d(args.pretrained_model_path, subfolder="unet", unet_additional_kwargs=OmegaConf.to_container(inference_config.unet_additional_kwargs)).cuda()
 
-        controlnet = None 
-
-        # set xformers
         if is_xformers_available() and (not args.without_xformers):
             unet.enable_xformers_memory_efficient_attention()
 
         pipeline = AnimationPipeline(
             vae=vae, text_encoder=text_encoder, tokenizer=tokenizer, unet=unet,
-            controlnet=controlnet,
+            controlnet=None,
             scheduler=DDIMScheduler(**OmegaConf.to_container(inference_config.noise_scheduler_kwargs)),
         ).to("cuda")
 
@@ -85,113 +82,122 @@ def main(args):
 
         prompts      = model_config.prompt
         n_prompts    = list(model_config.n_prompt) * len(prompts) if len(model_config.n_prompt) == 1 else model_config.n_prompt
-        
         random_seeds = model_config.get("seed", [-1])
         random_seeds = [random_seeds] if isinstance(random_seeds, int) else list(random_seeds)
         random_seeds = random_seeds * len(prompts) if len(random_seeds) == 1 else random_seeds
-        
         config[model_idx].random_seed = []
         
         for prompt_idx, (prompt, n_prompt, random_seed) in enumerate(zip(prompts, n_prompts, random_seeds)):
             
-            # 處理 Prompt 分隔
             if "|" in prompt:
                 bg_prompt, fg_prompt = [p.strip() for p in prompt.split("|", 1)]
                 combined_prompt_str = f"{bg_prompt}, {fg_prompt}"
-                print(f"\n[Info] Detected Split Prompt:")
-                print(f"  BG: {bg_prompt}")
-                print(f"  FG: {fg_prompt}")
+                print(f"\n[Info] BG: {bg_prompt} | FG: {fg_prompt}")
             else:
-                print(f"\n[Warning] No '|' separator found. Using full prompt.")
                 bg_prompt = "background" 
                 fg_prompt = prompt
                 combined_prompt_str = prompt
 
-            # 設定 Seed
-            if random_seed != -1: 
-                torch.manual_seed(random_seed)
-                current_seed = random_seed
-            else: 
-                torch.seed()
-                current_seed = torch.initial_seed()
-            
+            if random_seed != -1: torch.manual_seed(random_seed); current_seed = random_seed
+            else: torch.seed(); current_seed = torch.initial_seed()
             config[model_idx].random_seed.append(current_seed)
-            print(f"Sampling seed: {current_seed}")
-
+            
             # ==========================================
-            # Phase 1: Draft Generation
+            # Phase 1: Draft Generation (Store KV)
             # ==========================================
-            print(f"--- Step 1/3: Generating Draft Video ---")
+            print(f"--- Step 1: Generating Draft Video (Storing KV) ---")
             mask_controller.active = False
             
+            # [KV] 開啟 Store 模式
+            kv_controller.clear()
+            kv_controller.store_mode = True
+            
+            torch.manual_seed(current_seed)
             draft_output = pipeline(
-                prompt = combined_prompt_str, # 這裡傳入正常的 string
-                negative_prompt     = n_prompt,
+                prompt = combined_prompt_str,
+                negative_prompt = n_prompt,
                 num_inference_steps = model_config.steps,
-                guidance_scale      = model_config.guidance_scale,
-                width               = model_config.W,
-                height              = model_config.H,
-                video_length        = model_config.L,
+                guidance_scale = model_config.guidance_scale,
+                width = model_config.W,
+                height = model_config.H,
+                video_length = model_config.L,
             ).videos
-
+            
+            # [KV] 關閉 Store 模式
+            kv_controller.store_mode = False
+            
             save_videos_grid(draft_output, f"{savedir}/sample/{sample_idx}-1_draft.gif")
             
             # ==========================================
-            # Phase 2: Auto Mask Generation
+            # Phase 2: Mask Generation
             # ==========================================
-            print(f"--- Step 2/3: Generating Mask ---")
+            print(f"--- Step 2: Generating Mask ---")
+            generated_mask = None
             if "|" in prompt:
                 generated_mask = auto_masker.generate_mask_from_video_tensor(draft_output)
-                mask_vis = generated_mask.unsqueeze(1).repeat(1, 3, 1, 1, 1)
-                save_videos_grid(mask_vis, f"{savedir}/sample/{sample_idx}-2_mask.gif")
-            else:
-                print("Skipping mask generation.")
-                generated_mask = None
+                save_videos_grid(generated_mask.unsqueeze(1).repeat(1, 3, 1, 1, 1), f"{savedir}/sample/{sample_idx}-2_mask.gif")
 
             # ==========================================
-            # Phase 3: Refined Generation (Fix applied)
+            # Phase 3: Background Layer (KV Injection)
             # ==========================================
-            final_sample = draft_output 
-
-            if generated_mask is not None and "|" in prompt:
-                print(f"--- Step 3/3: Region-Aware Refinement ---")
+            bg_output = None
+            if generated_mask is not None:
+                print(f"--- Step 3: Generating Background (KV Injected) ---")
+                mask_controller.active = False
                 
-                # 1. 啟動 Controller
+                # [KV] 開啟 Inject 模式，並重置計數器
+                kv_controller.inject_mode = True
+                kv_controller.reset_counters()
+                
+                # 使用純雜訊 (latents=None 會自動生成) + 相同 Seed
+                torch.manual_seed(current_seed)
+                
+                bg_output = pipeline(
+                    prompt              = bg_prompt, # 只用背景 Prompt
+                    negative_prompt     = n_prompt,
+                    num_inference_steps = model_config.steps,
+                    guidance_scale      = model_config.guidance_scale,
+                    width               = model_config.W,
+                    height              = model_config.H,
+                    video_length        = model_config.L,
+                ).videos
+                
+                save_videos_grid(bg_output, f"{savedir}/sample/{sample_idx}-3_layer_bg.gif")
+
+            # ==========================================
+            # Phase 4: Foreground Layer (KV Injection + Region Aware)
+            # ==========================================
+            if generated_mask is not None:
+                print(f"--- Step 4: Generating Foreground (KV Injected) ---")
+                
+                # [Mask] 開啟 Region Aware，確保背景雜訊不干擾前景
                 mask_controller.set_masks(generated_mask)
                 
-                # 2. 準備 Embeddings (BG + FG)
+                # [KV] 重置計數器 (繼續 Inject)
+                kv_controller.reset_counters()
+                
+                # 準備 Embeddings (同前)
                 with torch.no_grad():
                     def encode_text(text):
                         tokens = tokenizer(text, max_length=77, padding="max_length", truncation=True, return_tensors="pt").input_ids.cuda()
                         return text_encoder(tokens)[0]
-
                     bg_embeds = encode_text(bg_prompt)
                     fg_embeds = encode_text(fg_prompt)
                     neg_embeds = encode_text(n_prompt)
+                    combined_embeds = torch.cat([bg_embeds, fg_embeds], dim=1) 
+                    combined_neg_embeds = torch.cat([neg_embeds, neg_embeds], dim=1)
 
-                    combined_embeds = torch.cat([bg_embeds, fg_embeds], dim=1) # [1, 154, Dim]
-                    combined_neg_embeds = torch.cat([neg_embeds, neg_embeds], dim=1) # [1, 154, Dim]
-
-                # 3. [FIX] 暫時替換 pipeline._encode_prompt
-                # 因為 AnimateDiff pipeline 寫死了只接受 string prompt，我們用這招繞過它
                 original_encode_prompt = pipeline._encode_prompt
-
                 def custom_encode_override(prompt, device, num_videos_per_prompt, do_classifier_free_guidance, negative_prompt):
-                    # 直接回傳我們準備好的 Embeddings
-                    # 格式必須是 [Unconditional, Conditional]
                     batch_neg = combined_neg_embeds.repeat(num_videos_per_prompt, 1, 1)
                     batch_pos = combined_embeds.repeat(num_videos_per_prompt, 1, 1)
                     return torch.cat([batch_neg, batch_pos])
-
-                # 掛載 Override
                 pipeline._encode_prompt = custom_encode_override
 
-                # 重置 Seed
+                # 生成
                 torch.manual_seed(current_seed)
-                
-                # 4. 執行 Pipeline (傳入 Dummy Prompt)
-                final_sample = pipeline(
-                    prompt              = "DUMMY_PROMPT_IGNORED", # 這裡隨便傳，因為會被 Override 忽略
+                fg_refined_context = pipeline(
+                    prompt              = "DUMMY", 
                     negative_prompt     = None,
                     num_inference_steps = model_config.steps,
                     guidance_scale      = model_config.guidance_scale,
@@ -199,19 +205,39 @@ def main(args):
                     height              = model_config.H,
                     video_length        = model_config.L,
                 ).videos
-
-                # 5. 還原原始函數 (重要！)
+                
                 pipeline._encode_prompt = original_encode_prompt
                 
-                save_videos_grid(final_sample, f"{savedir}/sample/{sample_idx}-3_refined.gif")
-            else:
-                print("Skipping refinement.")
+                # [KV] 結束，關閉 Inject
+                kv_controller.inject_mode = False
 
-            samples.append(final_sample)
-            
-            short_prompt = "-".join((prompt.replace("/", "").replace("|", "").split(" ")[:10]))
-            print(f"Saved sequence to {savedir}/sample/{sample_idx}-*.gif")
-            
+                # Extraction
+                mask_expanded = generated_mask.unsqueeze(1)
+                fg_layer = fg_refined_context * mask_expanded
+                save_videos_grid(fg_layer, f"{savedir}/sample/{sample_idx}-4_layer_fg.gif")
+                
+                # Save
+                layer_dir = f"{savedir}/layers/{sample_idx}"
+                os.makedirs(f"{layer_dir}/fg", exist_ok=True)
+                os.makedirs(f"{layer_dir}/bg", exist_ok=True)
+                
+                fg_np = rearrange(fg_refined_context[0], "c f h w -> f h w c").cpu().numpy()
+                bg_np = rearrange(bg_output[0], "c f h w -> f h w c").cpu().numpy()
+                mask_np = rearrange(generated_mask[0], "f h w -> f h w").cpu().numpy()
+                
+                fg_np = ((fg_np + 1) * 127.5).astype(np.uint8)
+                bg_np = ((bg_np + 1) * 127.5).astype(np.uint8)
+                mask_np = (mask_np * 255).astype(np.uint8)
+                
+                for f in range(model_config.L):
+                    Image.fromarray(bg_np[f]).save(f"{layer_dir}/bg/{f:04d}.png")
+                    r, g, b = fg_np[f, :, :, 0], fg_np[f, :, :, 1], fg_np[f, :, :, 2]
+                    alpha = mask_np[f]
+                    Image.fromarray(np.dstack((r, g, b, alpha))).save(f"{layer_dir}/fg/{f:04d}.png")
+                    
+                print(f"[Success] Layers saved to {layer_dir}")
+
+            samples.append(draft_output)
             sample_idx += 1
 
     if len(samples) > 0:
@@ -225,12 +251,9 @@ if __name__ == "__main__":
     parser.add_argument("--pretrained-model-path", type=str, default="runwayml/stable-diffusion-v1-5")
     parser.add_argument("--inference-config",      type=str, default="configs/inference/inference-v1.yaml")    
     parser.add_argument("--config",                type=str, required=True)
-    
     parser.add_argument("--L", type=int, default=16 )
-    parser.add_argument("--W", type=int, default=512)
-    parser.add_argument("--H", type=int, default=512)
-
+    parser.add_argument("--W", type=int, default=256)
+    parser.add_argument("--H", type=int, default=256)
     parser.add_argument("--without-xformers", action="store_true")
-
     args = parser.parse_args()
     main(args)
