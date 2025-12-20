@@ -294,7 +294,7 @@ class VersatileAttention(CrossAttention):
         # ----------------------------------------------------
         
         # 定義第一幀的重複次數。例如，1 次表示第一幀特徵將出現兩次 (原件 + 副本)。
-        DUPLICATION_FACTOR = 1 # MODIFIED: 增加錨點幀的 Key/Value 貢獻次數
+        DUPLICATION_FACTOR = 0 # MODIFIED: 增加錨點幀的 Key/Value 貢獻次數
         ATTENTION_WEIGHT_SCALE = 0.5
         
         # 獲取原始的 K/V 輸入序列 (對於 Temporal Self-Attention，即為 hidden_states)

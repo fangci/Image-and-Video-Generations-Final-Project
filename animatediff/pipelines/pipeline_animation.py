@@ -37,6 +37,7 @@ logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 @dataclass
 class AnimationPipelineOutput(BaseOutput):
     videos: Union[torch.Tensor, np.ndarray]
+    reference_eps: Optional[List[torch.FloatTensor]] = None
 
 
 class AnimationPipeline(DiffusionPipeline):
@@ -342,6 +343,8 @@ class AnimationPipeline(DiffusionPipeline):
         # --- 新增參數 ---
         latents_mask: Optional[torch.FloatTensor] = None, # 遮罩: 1代表要動, 0代表不動
         reference_latents: Optional[torch.FloatTensor] = None, # 參考幀或原始影片的 latents
+        reference_eps: Optional[List[torch.FloatTensor]] = None,
+        cache_reference_eps: bool = False,
         # ----------------
 
         **kwargs,
@@ -398,11 +401,13 @@ class AnimationPipeline(DiffusionPipeline):
         extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
 
         # Denoising loop
+        cached_reference_eps = [] if cache_reference_eps else None
+        extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
                 
-                # background masking
+                # # background masking
                 if latents_mask is not None and reference_latents is not None:
                     mask = latents_mask.to(latents.device, latents.dtype)
                     ref  = reference_latents.to(latents.device, latents.dtype)
@@ -412,8 +417,9 @@ class AnimationPipeline(DiffusionPipeline):
                         noise=torch.randn_like(ref),
                         timesteps=t
                     )
-
-                    latents = latents * mask + ref_noisy * (1 - mask)
+                    strength = t / self.scheduler.config.num_train_timesteps
+                    # latents = latents * mask + ref_noisy * (1 - mask)
+                    latents = latents * mask + (latents * (1 - strength) + ref_noisy * strength) * (1 - mask)
                     
                 # expand the latents if we are doing classifier free guidance
                 latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
@@ -444,6 +450,17 @@ class AnimationPipeline(DiffusionPipeline):
                         controlnet_cond[:,:,controlnet_image_index] = controlnet_images[:,:,:len(controlnet_image_index)]
                         controlnet_conditioning_mask[:,:,controlnet_image_index] = 1
 
+                        def controlnet_scale_schedule(i, total_steps):
+                            progress = i / total_steps
+                            if progress < 0.4:
+                                return 1.0
+                            elif progress < 0.7:
+                                return 1.0 - (progress - 0.4) / 0.3
+                            else:
+                                return 0.0
+                            
+                        controlnet_conditioning_scale = controlnet_scale_schedule(i, len(timesteps))
+                        
                         down_block_additional_residuals, mid_block_additional_residual = self.controlnet(
                             controlnet_noisy_latents, t,
                             encoder_hidden_states=controlnet_prompt_embeds,
@@ -482,6 +499,19 @@ class AnimationPipeline(DiffusionPipeline):
                 if do_classifier_free_guidance:
                     noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
                     noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+                
+                # --------- 新增：cache reference eps ---------
+                if cache_reference_eps:
+                    cached_reference_eps.append(noise_pred.detach())
+                # ------------------------------------------------  
+                if latents_mask is not None and reference_eps is not None:
+                    mask = latents_mask.to(noise_pred.device, noise_pred.dtype)
+
+                    # early–mid steps 才鎖 background
+                    step_ratio = i / len(timesteps)
+                    if step_ratio < 0.7:
+                        eps_bg = reference_eps[i].to(noise_pred.device, noise_pred.dtype)
+                        noise_pred = noise_pred * mask + eps_bg * (1 - mask)
 
                 # compute the previous noisy sample x_t -> x_t-1
                 latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs).prev_sample
@@ -521,4 +551,9 @@ class AnimationPipeline(DiffusionPipeline):
         if not return_dict:
             return video
 
+        if cache_reference_eps:
+            return AnimationPipelineOutput(
+                videos=video,
+                reference_eps=cached_reference_eps
+            )
         return AnimationPipelineOutput(videos=video)

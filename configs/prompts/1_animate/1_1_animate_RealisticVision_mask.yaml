@@ -5,8 +5,8 @@
   inference_config: "configs/inference/inference-v3.yaml"
   motion_module: "models/Motion_Module/v3_sd15_mm.ckpt"
 
-  controlnet_config: "configs/inference/sparsectrl/latent_condition.yaml"
-  controlnet_path:   "models/SparseCtrl/v3_sd15_sparsectrl_rgb.ckpt"
+  # controlnet_config: "configs/inference/sparsectrl/latent_condition.yaml"
+  # controlnet_path:   "models/SparseCtrl/v3_sd15_sparsectrl_rgb.ckpt"
 
   seed: -1
   steps: 25
@@ -21,9 +21,9 @@
     - "__assets__/demos/image/reference_1.png"
 
   prompt:
-    - "face, half body, girl, flower blossom, spring, 8k uhd, dslr, soft lighting, high quality, film grain, Fujifilm XT3"
+    - "face, half body, girl, pink hair, flower blossom, spring, 8k uhd, dslr, soft lighting, high quality, film grain, Fujifilm XT3"
     - "1girl, pink hair, outdoor, cherry blossom, sunlight, detailed background, realistic, intricate details, high quality, Fujifilm XT3, 8k uhd, dslr, soft lighting, film grain"
-    - "1girl, japanese anime style, building background, intricate details, realistic, high quality, Fujifilm XT3"
-    - "1girl, garden, flowers, sunlight, intricate details, realistic, high quality, Fujifilm XT3"
+    - "1girl, pink hair, japanese anime style, building background, intricate details, realistic, high quality, Fujifilm XT3"
+    - "1girl, pink hair, garden, flowers, sunlight, intricate details, realistic, high quality, Fujifilm XT3"
   n_prompt:
     - "semi-realistic, cgi, 3d, render, sketch, cartoon, drawing, anime, text, close up, cropped, out of frame, worst quality, low quality, jpeg artifacts, ugly, duplicate, morbid, mutilated, extra fingers, mutated hands, poorly drawn hands, poorly drawn face, mutation, deformed, blurry, dehydrated, bad anatomy, bad proportions, extra limbs, cloned face, disfigured, gross proportions, malformed limbs, missing arms, missing legs, extra arms, extra legs, fused fingers, too many fingers, long neck"

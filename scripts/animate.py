@@ -155,7 +155,7 @@ def main(args):
             
             # 4. 處理後的遮罩張量 [1, 1, latent_h, latent_w]
             latents_mask = mask_transforms(mask_img).unsqueeze(0)
-            latents_mask = (latents_mask > 0.5).float().cuda()
+            latents_mask = (latents_mask < 0.5).float().cuda()
             
             # 5. 擴展到視頻長度 [1, 1, video_length, latent_h, latent_w]
             latents_mask = repeat(latents_mask, "b c h w -> b c f h w", f=model_config.L)
@@ -215,6 +215,27 @@ def main(args):
             
             print(f"current seed: {torch.initial_seed()}")
             print(f"sampling {prompt} ...")
+            # =========================
+            # Pass 1: reference eps
+            # =========================
+            with torch.no_grad():
+                ref_out = pipeline(
+                    prompt,
+                    negative_prompt     = n_prompt,
+                    num_inference_steps = model_config.steps,
+                    guidance_scale      = model_config.guidance_scale,
+                    width               = model_config.W,
+                    height              = model_config.H,
+                    video_length        = model_config.L,
+
+                    controlnet_images       = controlnet_images,
+                    controlnet_image_index  = model_config.get("controlnet_image_indexs", [0]),
+
+                    cache_reference_eps = True,
+                )
+
+            reference_eps = ref_out.reference_eps
+            
             sample = pipeline(
                 prompt,
                 negative_prompt     = n_prompt,
@@ -229,7 +250,8 @@ def main(args):
 
                 # --- 新增傳遞給 pipeline_animation.py 的參數 ---
                 latents_mask      = latents_mask,
-                reference_latents = reference_latents,
+                reference_latents = None,
+                reference_eps     = reference_eps,
                 # --------------------------------------------
             ).videos
             samples.append(sample)
