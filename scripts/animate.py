@@ -250,7 +250,7 @@ def main(args):
 
                 # --- 新增傳遞給 pipeline_animation.py 的參數 ---
                 latents_mask      = latents_mask,
-                reference_latents = None,
+                reference_latents = reference_latents,
                 reference_eps     = reference_eps,
                 # --------------------------------------------
             ).videos
