@@ -14,9 +14,8 @@ from tqdm.auto import tqdm
 from transformers import CLIPTextModel, CLIPTokenizer
 
 from animatediff.models.unet import UNet3DConditionModel
-from animatediff.models.sparse_controlnet import SparseControlNetModel
 from animatediff.pipelines.pipeline_animation import AnimationPipeline
-from animatediff.utils.util import save_videos_grid, load_weights, auto_download
+from animatediff.utils.util import save_videos_grid, load_weights
 from diffusers.utils.import_utils import is_xformers_available
 
 from einops import rearrange, repeat
@@ -26,9 +25,85 @@ from pathlib import Path
 from PIL import Image
 import numpy as np
 
-# 引入 Mask & KV 工具 (請確保 attention.py 已更新)
-from animatediff.models.attention import KVCacheController
-from animatediff.utils.mask_util import AttentionMaskController, AutoMaskGenerator
+# Mask 工具
+from animatediff.utils.mask_util import AutoMaskGenerator
+
+# 輔助函式：將生成的 Video Tensor (0~1) 轉回 VAE Latents
+def encode_video_to_latents(video_tensor, vae):
+    # video_tensor: [b, c, f, h, w], value range [0, 1]
+    video_length = video_tensor.shape[2]
+    
+    # Rearrange to [b*f, c, h, w] for VAE
+    x = rearrange(video_tensor, "b c f h w -> (b f) c h w")
+    
+    # Normalize to [-1, 1]
+    x = 2.0 * x - 1.0
+    
+    # Encode
+    latents = vae.encode(x).latent_dist.sample()
+    latents = latents * 0.18215
+    
+    # Rearrange back to [b, c, f, h, w]
+    latents = rearrange(latents, "(b f) c h w -> b c f h w", f=video_length)
+    return latents
+
+# 輔助函式：執行部分去噪 (SDEdit / Img2Img loop)
+@torch.no_grad()
+def run_denoising_loop(pipeline, prompt, n_prompt, latents, guidance_scale, video_length):
+    """
+    執行 Pipeline 的後半段去噪過程 (Final Generation)。
+    """
+    vae = pipeline.vae
+    device = pipeline.device
+    scheduler = pipeline.scheduler
+    unet = pipeline.unet
+    text_encoder = pipeline.text_encoder
+    tokenizer = pipeline.tokenizer
+    
+    # 1. Encode Prompts
+    text_input = tokenizer(prompt, padding="max_length", max_length=tokenizer.model_max_length, truncation=True, return_tensors="pt")
+    text_embeddings = text_encoder(text_input.input_ids.to(device))[0]
+    
+    uncond_input = tokenizer(n_prompt, padding="max_length", max_length=tokenizer.model_max_length, truncation=True, return_tensors="pt")
+    uncond_embeddings = text_encoder(uncond_input.input_ids.to(device))[0]
+    
+    context = torch.cat([uncond_embeddings, text_embeddings])
+    
+    # 2. Denoising Loop
+    # 注意：這裡直接使用 scheduler.timesteps，這些 steps 必須在外部 (main) 設定好
+    timesteps = scheduler.timesteps
+    
+    current_latents = latents.clone()
+    
+    for t in tqdm(timesteps, desc=f"Final Gen: {prompt[:10]}..."):
+        # Expand latents for CFG
+        latent_model_input = torch.cat([current_latents] * 2)
+        latent_model_input = scheduler.scale_model_input(latent_model_input, t)
+        
+        # Predict noise
+        noise_pred = unet(
+            latent_model_input, 
+            t, 
+            encoder_hidden_states=context,
+            down_block_additional_residuals=None,
+            mid_block_additional_residual=None,
+        ).sample
+        
+        # CFG
+        noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+        noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+        
+        # Step
+        current_latents = scheduler.step(noise_pred, t, current_latents).prev_sample
+
+    # 3. Decode Latents
+    latents = 1 / 0.18215 * current_latents
+    latents = rearrange(latents, "b c f h w -> (b f) c h w")
+    video = vae.decode(latents).sample
+    video = rearrange(video, "(b f) c h w -> b c f h w", f=video_length)
+    
+    video = (video / 2 + 0.5).clamp(0, 1)
+    return video
 
 @torch.no_grad()
 def main(args):
@@ -43,13 +118,16 @@ def main(args):
     samples = []
 
     # 初始化控制器
-    mask_controller = AttentionMaskController.get_instance()
-    kv_controller = KVCacheController.get_instance() # [NEW]
     auto_masker = AutoMaskGenerator()
 
     tokenizer    = CLIPTokenizer.from_pretrained(args.pretrained_model_path, subfolder="tokenizer")
     text_encoder = CLIPTextModel.from_pretrained(args.pretrained_model_path, subfolder="text_encoder").cuda()
     vae          = AutoencoderKL.from_pretrained(args.pretrained_model_path, subfolder="vae").cuda()
+
+    # 設定重繪強度 (Denoising Strength)
+    # 這次因為是拼接好的圖，我們希望保留多一點結構，但也需要足夠的強度來融合
+    # 建議 0.5 - 0.7
+    denoising_strength = getattr(args, "strength", 0.6)
 
     sample_idx = 0
     for model_idx, model_config in enumerate(config):
@@ -103,18 +181,15 @@ def main(args):
             config[model_idx].random_seed.append(current_seed)
             
             # ==========================================
-            # Phase 1: Draft Generation (Store KV)
+            # Step 1: Generate Separate BG and FG Drafts
             # ==========================================
-            print(f"--- Step 1: Generating Draft Video (Storing KV) ---")
-            mask_controller.active = False
+            # 為了讓兩者動作盡量一致，我們使用相同的 Seed 生成
             
-            # [KV] 開啟 Store 模式
-            kv_controller.clear()
-            kv_controller.store_mode = True
-            
+            # 1a. Background Draft
+            print(f"--- Step 1a: Generating BG Draft ---")
             torch.manual_seed(current_seed)
-            draft_output = pipeline(
-                prompt = combined_prompt_str,
+            bg_draft = pipeline(
+                prompt = bg_prompt,
                 negative_prompt = n_prompt,
                 num_inference_steps = model_config.steps,
                 guidance_scale = model_config.guidance_scale,
@@ -122,122 +197,102 @@ def main(args):
                 height = model_config.H,
                 video_length = model_config.L,
             ).videos
+            save_videos_grid(bg_draft, f"{savedir}/sample/{sample_idx}-1a_bg_draft.gif")
             
-            # [KV] 關閉 Store 模式
-            kv_controller.store_mode = False
+            # 1b. Foreground Draft
+            print(f"--- Step 1b: Generating FG Draft ---")
+            torch.manual_seed(current_seed)
+            fg_draft = pipeline(
+                prompt = fg_prompt,
+                negative_prompt = n_prompt,
+                num_inference_steps = model_config.steps,
+                guidance_scale = model_config.guidance_scale,
+                width = model_config.W,
+                height = model_config.H,
+                video_length = model_config.L,
+            ).videos
+            save_videos_grid(fg_draft, f"{savedir}/sample/{sample_idx}-1b_fg_draft.gif")
+
+            # ==========================================
+            # Step 2: Generate Mask from FG
+            # ==========================================
+            print(f"--- Step 2: Generating Mask from FG ---")
+            generated_mask = auto_masker.generate_mask_from_video_tensor(fg_draft)
             
-            save_videos_grid(draft_output, f"{savedir}/sample/{sample_idx}-1_draft.gif")
+            # Save Mask
+            save_videos_grid(generated_mask.unsqueeze(1).repeat(1, 3, 1, 1, 1), f"{savedir}/sample/{sample_idx}-2_mask.gif")
+
+            # ==========================================
+            # Step 3: Composite (Collage)
+            # ==========================================
+            print(f"--- Step 3: Compositing (Collage) ---")
             
-            # ==========================================
-            # Phase 2: Mask Generation
-            # ==========================================
-            print(f"--- Step 2: Generating Mask ---")
-            generated_mask = None
-            if "|" in prompt:
-                generated_mask = auto_masker.generate_mask_from_video_tensor(draft_output)
-                save_videos_grid(generated_mask.unsqueeze(1).repeat(1, 3, 1, 1, 1), f"{savedir}/sample/{sample_idx}-2_mask.gif")
+            mask_expanded = generated_mask.unsqueeze(1) # [b, 1, f, h, w]
+            
+            # Composite Logic: FG * Mask + BG * (1 - Mask)
+            # 確保都在同一 device
+            fg_draft = fg_draft.to(pipeline.device)
+            bg_draft = bg_draft.to(pipeline.device)
+            mask_expanded = mask_expanded.to(pipeline.device)
+            
+            composite_video = fg_draft * mask_expanded + bg_draft * (1.0 - mask_expanded)
+            
+            save_videos_grid(composite_video.cpu(), f"{savedir}/sample/{sample_idx}-3_composite.gif")
 
             # ==========================================
-            # Phase 3: Background Layer (KV Injection)
+            # Step 4: Add Noise (Prepare for SDEdit)
             # ==========================================
-            bg_output = None
-            if generated_mask is not None:
-                print(f"--- Step 3: Generating Background (KV Injected) ---")
-                mask_controller.active = False
-                
-                # [KV] 開啟 Inject 模式，並重置計數器
-                kv_controller.inject_mode = True
-                kv_controller.reset_counters()
-                
-                # 使用純雜訊 (latents=None 會自動生成) + 相同 Seed
-                torch.manual_seed(current_seed)
-                
-                bg_output = pipeline(
-                    prompt              = bg_prompt, # 只用背景 Prompt
-                    negative_prompt     = n_prompt,
-                    num_inference_steps = model_config.steps,
-                    guidance_scale      = model_config.guidance_scale,
-                    width               = model_config.W,
-                    height              = model_config.H,
-                    video_length        = model_config.L,
-                ).videos
-                
-                save_videos_grid(bg_output, f"{savedir}/sample/{sample_idx}-3_layer_bg.gif")
+            print(f"--- Step 4: Adding Noise to Composite ---")
+            
+            # 4.1 Encode Composite to Latents
+            init_latents = encode_video_to_latents(composite_video, vae)
+            
+            # 4.2 Setup Scheduler
+            pipeline.scheduler.set_timesteps(model_config.steps)
+            
+            # 計算開始的 Step
+            t_start_index = int(len(pipeline.scheduler.timesteps) * (1 - denoising_strength))
+            t_start = pipeline.scheduler.timesteps[t_start_index]
+            
+            # 4.3 Add Noise
+            # 使用與 Draft 相同的 Seed 來加噪，這有助於讓原本的細節更好地保留在 Latent 中
+            torch.manual_seed(current_seed)
+            noise = torch.randn_like(init_latents)
+            noisy_latents = pipeline.scheduler.add_noise(init_latents, noise, t_start)
+            
+            # 4.4 Visualize Noisy Latents
+            with torch.no_grad():
+                temp_latents = 1 / 0.18215 * noisy_latents
+                temp_latents = rearrange(temp_latents, "b c f h w -> (b f) c h w")
+                noisy_vis = vae.decode(temp_latents).sample
+                noisy_vis = rearrange(noisy_vis, "(b f) c h w -> b c f h w", f=model_config.L)
+                noisy_vis = (noisy_vis / 2 + 0.5).clamp(0, 1)
+                save_videos_grid(noisy_vis.cpu(), f"{savedir}/sample/{sample_idx}-4_noisy_input.gif")
 
             # ==========================================
-            # Phase 4: Foreground Layer (KV Injection + Region Aware)
+            # Step 5: Final Generation (Denoise from Composite)
             # ==========================================
-            if generated_mask is not None:
-                print(f"--- Step 4: Generating Foreground (KV Injected) ---")
-                
-                # [Mask] 開啟 Region Aware，確保背景雜訊不干擾前景
-                mask_controller.set_masks(generated_mask)
-                
-                # [KV] 重置計數器 (繼續 Inject)
-                kv_controller.reset_counters()
-                
-                # 準備 Embeddings (同前)
-                with torch.no_grad():
-                    def encode_text(text):
-                        tokens = tokenizer(text, max_length=77, padding="max_length", truncation=True, return_tensors="pt").input_ids.cuda()
-                        return text_encoder(tokens)[0]
-                    bg_embeds = encode_text(bg_prompt)
-                    fg_embeds = encode_text(fg_prompt)
-                    neg_embeds = encode_text(n_prompt)
-                    combined_embeds = torch.cat([bg_embeds, fg_embeds], dim=1) 
-                    combined_neg_embeds = torch.cat([neg_embeds, neg_embeds], dim=1)
-
-                original_encode_prompt = pipeline._encode_prompt
-                def custom_encode_override(prompt, device, num_videos_per_prompt, do_classifier_free_guidance, negative_prompt):
-                    batch_neg = combined_neg_embeds.repeat(num_videos_per_prompt, 1, 1)
-                    batch_pos = combined_embeds.repeat(num_videos_per_prompt, 1, 1)
-                    return torch.cat([batch_neg, batch_pos])
-                pipeline._encode_prompt = custom_encode_override
-
-                # 生成
-                torch.manual_seed(current_seed)
-                fg_refined_context = pipeline(
-                    prompt              = "DUMMY", 
-                    negative_prompt     = None,
-                    num_inference_steps = model_config.steps,
-                    guidance_scale      = model_config.guidance_scale,
-                    width               = model_config.W,
-                    height              = model_config.H,
-                    video_length        = model_config.L,
-                ).videos
-                
-                pipeline._encode_prompt = original_encode_prompt
-                
-                # [KV] 結束，關閉 Inject
-                kv_controller.inject_mode = False
-
-                # Extraction
-                mask_expanded = generated_mask.unsqueeze(1)
-                fg_layer = fg_refined_context * mask_expanded
-                save_videos_grid(fg_layer, f"{savedir}/sample/{sample_idx}-4_layer_fg.gif")
-                
-                # Save
-                layer_dir = f"{savedir}/layers/{sample_idx}"
-                os.makedirs(f"{layer_dir}/fg", exist_ok=True)
-                os.makedirs(f"{layer_dir}/bg", exist_ok=True)
-                
-                fg_np = rearrange(fg_refined_context[0], "c f h w -> f h w c").cpu().numpy()
-                bg_np = rearrange(bg_output[0], "c f h w -> f h w c").cpu().numpy()
-                mask_np = rearrange(generated_mask[0], "f h w -> f h w").cpu().numpy()
-                
-                fg_np = ((fg_np + 1) * 127.5).astype(np.uint8)
-                bg_np = ((bg_np + 1) * 127.5).astype(np.uint8)
-                mask_np = (mask_np * 255).astype(np.uint8)
-                
-                for f in range(model_config.L):
-                    Image.fromarray(bg_np[f]).save(f"{layer_dir}/bg/{f:04d}.png")
-                    r, g, b = fg_np[f, :, :, 0], fg_np[f, :, :, 1], fg_np[f, :, :, 2]
-                    alpha = mask_np[f]
-                    Image.fromarray(np.dstack((r, g, b, alpha))).save(f"{layer_dir}/fg/{f:04d}.png")
-                    
-                print(f"[Success] Layers saved to {layer_dir}")
-
-            samples.append(draft_output)
+            print(f"--- Step 5: Final Generation (Harmonizing) ---")
+            
+            # 準備 Scheduler Timesteps (只跑剩下的部分)
+            full_timesteps = pipeline.scheduler.timesteps
+            final_timesteps = full_timesteps[t_start_index:]
+            pipeline.scheduler.timesteps = final_timesteps
+            
+            torch.manual_seed(current_seed)
+            final_output = run_denoising_loop(
+                pipeline,
+                prompt=combined_prompt_str, # 使用完整的 Prompt (如 "candle in a room")
+                n_prompt=n_prompt,
+                latents=noisy_latents,
+                guidance_scale=model_config.guidance_scale,
+                video_length=model_config.L
+            )
+            
+            save_videos_grid(final_output.cpu(), f"{savedir}/sample/{sample_idx}-5_final_output.gif")
+            print(f"[Success] Sample {sample_idx} completed.")
+            
+            samples.append(final_output.cpu())
             sample_idx += 1
 
     if len(samples) > 0:
@@ -254,6 +309,7 @@ if __name__ == "__main__":
     parser.add_argument("--L", type=int, default=16 )
     parser.add_argument("--W", type=int, default=256)
     parser.add_argument("--H", type=int, default=256)
+    parser.add_argument("--strength", type=float, default=0.65, help="Denoising strength (0.5-0.8 recommended).")
     parser.add_argument("--without-xformers", action="store_true")
     args = parser.parse_args()
     main(args)
