@@ -5,8 +5,8 @@
   inference_config: "configs/inference/inference-v3.yaml"
   motion_module: "models/Motion_Module/v3_sd15_mm.ckpt"
 
-  # controlnet_config: "configs/inference/sparsectrl/latent_condition.yaml"
-  # controlnet_path:   "models/SparseCtrl/v3_sd15_sparsectrl_rgb.ckpt"
+  controlnet_config: "configs/inference/sparsectrl/latent_condition.yaml"
+  controlnet_path:   "models/SparseCtrl/v3_sd15_sparsectrl_rgb.ckpt"
 
   seed: -1
   steps: 25

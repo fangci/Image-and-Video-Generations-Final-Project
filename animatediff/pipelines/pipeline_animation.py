@@ -450,16 +450,17 @@ class AnimationPipeline(DiffusionPipeline):
                         controlnet_cond[:,:,controlnet_image_index] = controlnet_images[:,:,:len(controlnet_image_index)]
                         controlnet_conditioning_mask[:,:,controlnet_image_index] = 1
 
-                        def controlnet_scale_schedule(i, total_steps):
-                            progress = i / total_steps
-                            if progress < 0.4:
-                                return 1.0
-                            elif progress < 0.7:
-                                return 1.0 - (progress - 0.4) / 0.3
-                            else:
-                                return 0.0
-                            
-                        controlnet_conditioning_scale = controlnet_scale_schedule(i, len(timesteps))
+                        if latents_mask is not None or cache_reference_eps:
+                            def controlnet_scale_schedule(i, total_steps):
+                                progress = i / total_steps
+                                if progress < 0.2:
+                                    return 0.8
+                                elif progress < 0.4:
+                                    return 0.8 - (progress - 0.2) / 0.2 * 0.8
+                                else:
+                                    return 0.0
+                                
+                            controlnet_conditioning_scale = controlnet_scale_schedule(i, len(timesteps))
                         
                         down_block_additional_residuals, mid_block_additional_residual = self.controlnet(
                             controlnet_noisy_latents, t,
@@ -515,25 +516,6 @@ class AnimationPipeline(DiffusionPipeline):
 
                 # compute the previous noisy sample x_t -> x_t-1
                 latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs).prev_sample
-
-                # # ----------------------------------------------------
-                # # 實作 Latent Mask Blending   ###如果只用這段不加unet前那段會讓first frame和其他frame畫風割裂###
-                # # ----------------------------------------------------
-                # if latents_mask is not None and reference_latents is not None:
-                #     # 確保 mask 與 latents 裝置一致
-                #     mask = latents_mask.to(latents.device, dtype=latents.dtype)
-                #     ref = reference_latents.to(latents.device, dtype=latents.dtype)
-                    
-                #     noise = torch.randn_like(ref)
-                #     ref_noisy = self.scheduler.add_noise(ref, noise, t)
-                    
-                #     step_ratio = t / self.scheduler.config.num_train_timesteps
-                #     # 在前期 (step_ratio 接近 1.0) 減少背景強制混合的強度，允許模型產生光影過渡
-                #     # 在後期 (step_ratio 接近 0.0) 完全鎖定背景以維持穩定
-                #     blend_factor = 1.0 - step_ratio 
-                #     latents = (ref_noisy * (1 - latents_mask) + latents * latents_mask) * blend_factor + \
-                #             latents * (1 - blend_factor)
-                # # ----------------------------------------------------
 
                 # call the callback, if provided
                 if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):

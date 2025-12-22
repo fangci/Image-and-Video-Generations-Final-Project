@@ -155,7 +155,7 @@ def main(args):
             
             # 4. 處理後的遮罩張量 [1, 1, latent_h, latent_w]
             latents_mask = mask_transforms(mask_img).unsqueeze(0)
-            latents_mask = (latents_mask < 0.5).float().cuda()
+            latents_mask = (latents_mask > 0.5).float().cuda()
             
             # 5. 擴展到視頻長度 [1, 1, video_length, latent_h, latent_w]
             latents_mask = repeat(latents_mask, "b c h w -> b c f h w", f=model_config.L)
