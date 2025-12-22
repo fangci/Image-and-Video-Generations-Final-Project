@@ -10,7 +10,7 @@
   guidance_scale: 7.5
 
   prompt:
-    - "blurry background, garden | 1girl, looking at viewer, blurry background, upper body, contemporary, dress, best quality, masterpiece"
+    - "1girl, looking at viewer, blurry background, upper body, contemporary, dress, best quality, masterpiece :: blurry background, garden"
 
   n_prompt:
     - "worst quality, low quality, letterboxed"
@@ -28,7 +28,7 @@
   guidance_scale: 7.5
 
   prompt:
-    - "blurry background, garden | 1girl, looking at viewer, blurry background, upper body, contemporary, dress, best quality, masterpiece"
+    - "1girl, looking at viewer, blurry background, upper body, contemporary, dress, best quality, masterpiece :: blurry background, garden"
 
   n_prompt:
     - "worst quality, low quality, letterboxed"

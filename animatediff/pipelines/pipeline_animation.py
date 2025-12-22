@@ -31,6 +31,9 @@ from ..models.unet import UNet3DConditionModel
 from ..models.sparse_controlnet import SparseControlNetModel
 import pdb
 
+# [修改點 1] 引入 Attention State Manager
+from ..models.attention import SharedAttentionState
+
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
 
@@ -345,6 +348,9 @@ class AnimationPipeline(DiffusionPipeline):
         reference_latents: Optional[torch.FloatTensor] = None, # 參考幀或原始影片的 latents
         reference_eps: Optional[List[torch.FloatTensor]] = None,
         cache_reference_eps: bool = False,
+        
+        # [修改點 2] Attention 操作模式
+        attention_op_mode: str = "normal", # "normal", "record", "inject"
         # ----------------
 
         **kwargs,
@@ -397,6 +403,10 @@ class AnimationPipeline(DiffusionPipeline):
         )
         latents_dtype = latents.dtype
 
+        # [修改點 3] 設定 Attention State
+        attn_state = SharedAttentionState.get_instance()
+        attn_state.set_mode(attention_op_mode)
+
         # Prepare extra step kwargs.
         extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
 
@@ -407,6 +417,10 @@ class AnimationPipeline(DiffusionPipeline):
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
                 
+                # [修改點 4] 重置 Attention Counter (確保每一幀都從第一層開始讀寫)
+                if attention_op_mode != "normal":
+                    attn_state.counter = 0
+
                 # # background masking
                 if latents_mask is not None and reference_latents is not None:
                     mask = latents_mask.to(latents.device, latents.dtype)
@@ -516,30 +530,14 @@ class AnimationPipeline(DiffusionPipeline):
                 # compute the previous noisy sample x_t -> x_t-1
                 latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs).prev_sample
 
-                # # ----------------------------------------------------
-                # # 實作 Latent Mask Blending   ###如果只用這段不加unet前那段會讓first frame和其他frame畫風割裂###
-                # # ----------------------------------------------------
-                # if latents_mask is not None and reference_latents is not None:
-                #     # 確保 mask 與 latents 裝置一致
-                #     mask = latents_mask.to(latents.device, dtype=latents.dtype)
-                #     ref = reference_latents.to(latents.device, dtype=latents.dtype)
-                    
-                #     noise = torch.randn_like(ref)
-                #     ref_noisy = self.scheduler.add_noise(ref, noise, t)
-                    
-                #     step_ratio = t / self.scheduler.config.num_train_timesteps
-                #     # 在前期 (step_ratio 接近 1.0) 減少背景強制混合的強度，允許模型產生光影過渡
-                #     # 在後期 (step_ratio 接近 0.0) 完全鎖定背景以維持穩定
-                #     blend_factor = 1.0 - step_ratio 
-                #     latents = (ref_noisy * (1 - latents_mask) + latents * latents_mask) * blend_factor + \
-                #             latents * (1 - blend_factor)
-                # # ----------------------------------------------------
-
                 # call the callback, if provided
                 if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
                     progress_bar.update()
                     if callback is not None and i % callback_steps == 0:
                         callback(i, t, latents)
+
+        # [修改點 5] 結束後重置 State
+        attn_state.reset()
 
         # Post-processing
         video = self.decode_latents(latents)
