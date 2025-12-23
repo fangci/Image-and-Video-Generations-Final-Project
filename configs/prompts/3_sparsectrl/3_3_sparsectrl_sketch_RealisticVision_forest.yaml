@@ -3,7 +3,7 @@
   adapter_lora_path: "models/Motion_Module/v3_sd15_adapter.ckpt"
   dreambooth_path:    "models/DreamBooth_LoRA/realisticVisionV60B1_v51VAE.safetensors"
 
-  inference_config: "configs/inference/inference-v3_mask.yaml"
+  inference_config: "configs/inference/inference-v3.yaml"
   motion_module:    "models/Motion_Module/v3_sd15_mm.ckpt"
 
   controlnet_config: "configs/inference/sparsectrl/image_condition.yaml"

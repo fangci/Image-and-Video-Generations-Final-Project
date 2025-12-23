@@ -2,7 +2,7 @@
 - dreambooth_path: "models/DreamBooth_LoRA/realisticVisionV60B1_v51VAE.safetensors"
   lora_model_path: ""
 
-  inference_config: "configs/inference/inference-v3_mask.yaml"
+  inference_config: "configs/inference/inference-v3.yaml"
   motion_module: "models/Motion_Module/v3_sd15_mm.ckpt"
 
   controlnet_config: "configs/inference/sparsectrl/latent_condition.yaml"
