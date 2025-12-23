@@ -26,16 +26,13 @@ if is_xformers_available():
 else:
     xformers = None
 
-# ==========================================
-# [新增] Shared Attention State 全域管理器
-# ==========================================
 class SharedAttentionState:
     _instance = None
     
     def __init__(self):
-        self.mode = "normal" # normal, record, inject
-        self.cache = {}      # 儲存 KV: {layer_id: (key, value)}
-        self.counter = 0     # 用於追蹤目前跑到第幾層
+        self.mode = "normal"
+        self.cache = {}
+        self.counter = 0
     
     @classmethod
     def get_instance(cls):
@@ -50,24 +47,17 @@ class SharedAttentionState:
     
     def set_mode(self, mode):
         self.mode = mode
-        # 切換模式時不清除 cache (因為 inject 需要讀取 record 的 cache)
-        # 但重置 counter
         self.counter = 0
 
-# ==========================================
-# [新增] Reference Cross Attention (支援 KV Injection)
-# ==========================================
 class ReferenceCrossAttention(CrossAttention):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
     def forward(self, hidden_states, encoder_hidden_states=None, attention_mask=None, **kwargs):
-        # 取得全域狀態
         state = SharedAttentionState.get_instance()
         
         query = self.to_q(hidden_states)
         
-        # 判斷是否為 Self-Attention (encoder_hidden_states is None)
         is_self_attn = (encoder_hidden_states is None)
         
         if is_self_attn:
@@ -78,39 +68,29 @@ class ReferenceCrossAttention(CrossAttention):
         key = self.to_k(sequence_input)
         value = self.to_v(sequence_input)
 
-        # --- 核心邏輯：Record / Inject ---
-        # 只針對 Self-Attention 進行操作
         if is_self_attn and state.mode != "normal":
             current_id = state.counter
             
             if state.mode == "record":
-                # [Record Mode]: 儲存背景的 K/V
                 state.cache[current_id] = (key.detach(), value.detach())
                 
             elif state.mode == "inject":
-                # [Inject Mode]: 讀取背景 K/V 並拼接
                 if current_id in state.cache:
                     bg_key, bg_value = state.cache[current_id]
                     
-                    # 檢查 Device (確保在同一張卡上)
                     if bg_key.device != key.device:
                         bg_key = bg_key.to(key.device)
                         bg_value = bg_value.to(value.device)
 
-                    # 拼接: [BG Features, FG Features]
-                    # dim=1 是 sequence length
                     key = torch.cat([bg_key, key], dim=1)
                     value = torch.cat([bg_value, value], dim=1)
             
-            # 推進計數器
             state.counter += 1
-        # -------------------------------
 
         query = self.reshape_heads_to_batch_dim(query)
         key = self.reshape_heads_to_batch_dim(key)
         value = self.reshape_heads_to_batch_dim(value)
 
-        # 以下為標準 Attention 計算
         if self._use_memory_efficient_attention_xformers:
             hidden_states = self._memory_efficient_attention_xformers(query, key, value, attention_mask)
             hidden_states = hidden_states.to(query.dtype)
@@ -251,12 +231,7 @@ class BasicTransformerBlock(nn.Module):
         self.unet_use_cross_frame_attention = unet_use_cross_frame_attention
         self.unet_use_temporal_attention = unet_use_temporal_attention
 
-        # [修改] 使用 ReferenceCrossAttention 替換原本的 SC-Attn (attn1)
-        # 這樣才能在 Self-Attention 階段注入背景特徵
         if unet_use_cross_frame_attention:
-            # 這裡簡化處理：如果用了 SparseCausalAttention2D，可能需要另外實作 Inject 邏輯
-            # 在此範例中，我們假設主要使用標準 Attention 機制進行注入
-            # 如果需要兼容 Sparse Attention，請將 Reference 邏輯整合進 SparseCausalAttention2D
             self.attn1 = ReferenceCrossAttention(
                 query_dim=dim, heads=num_attention_heads, dim_head=attention_head_dim, dropout=dropout,
                 bias=attention_bias, cross_attention_dim=cross_attention_dim if only_cross_attention else None,
@@ -269,7 +244,6 @@ class BasicTransformerBlock(nn.Module):
             )
         self.norm1 = AdaLayerNorm(dim, num_embeds_ada_norm) if self.use_ada_layer_norm else nn.LayerNorm(dim)
 
-        # Cross-Attn (attn2) - Text Conditioning (保持原狀)
         if cross_attention_dim is not None:
             self.attn2 = CrossAttention(
                 query_dim=dim, cross_attention_dim=cross_attention_dim, heads=num_attention_heads,
@@ -302,11 +276,10 @@ class BasicTransformerBlock(nn.Module):
             self.attn2._use_memory_efficient_attention_xformers = use_memory_efficient_attention_xformers
 
     def forward(self, hidden_states, encoder_hidden_states=None, timestep=None, attention_mask=None, video_length=None):
-        # 1. Self-Attn (含 Reference Injection 邏輯)
+        # 1. Self-Attn
         norm_hidden_states_1 = self.norm1(hidden_states, timestep) if self.use_ada_layer_norm else self.norm1(hidden_states)
         
         if self.unet_use_cross_frame_attention:
-            # 注意：這裡的 forward 會調用 ReferenceCrossAttention
             hidden_states = self.attn1(norm_hidden_states_1, attention_mask=attention_mask, video_length=video_length) + hidden_states
         else:
             hidden_states = self.attn1(norm_hidden_states_1, attention_mask=attention_mask) + hidden_states
@@ -317,7 +290,6 @@ class BasicTransformerBlock(nn.Module):
             
             mask_controller = AttentionMaskController.get_instance()
             if mask_controller.active and encoder_hidden_states.shape[1] > 77:
-                # 保留原本的 Mask Control 邏輯 (此處省略部分代碼以保持簡潔，與原代碼一致即可)
                 hidden_states = self.attn2(norm_hidden_states_2, encoder_hidden_states=encoder_hidden_states, attention_mask=attention_mask) + hidden_states
             else:
                 hidden_states = self.attn2(norm_hidden_states_2, encoder_hidden_states=encoder_hidden_states, attention_mask=attention_mask) + hidden_states

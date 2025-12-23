@@ -27,32 +27,20 @@ from pathlib import Path
 from PIL import Image
 import numpy as np
 
-# [新增] 引入 rembg
-from rembg import remove
-
-# 引入 SharedAttentionState 確保環境初始化 (Optional)
 from animatediff.models.attention import SharedAttentionState
 
-# ==========================================
-# 引入 BiRefNet 必要的函式庫
-# ==========================================
 from transformers import AutoModelForImageSegmentation
 from torchvision import transforms
 from PIL import Image
 import torch.nn.functional as F
 
-# 初始化全域變數，避免每次迴圈都重新載入模型 (會很慢)
 _birefnet_model = None
 _birefnet_transform = None
 
 def load_birefnet_model(device="cuda"):
-    """
-    載入 BiRefNet 模型 (只載入一次)
-    """
     global _birefnet_model, _birefnet_transform
     if _birefnet_model is None:
         print("Loading BiRefNet model (ZhengPeng7/BiRefNet)... this may take a while first time.")
-        # 使用 HuggingFace 下載模型
         _birefnet_model = AutoModelForImageSegmentation.from_pretrained(
             "ZhengPeng7/BiRefNet", 
             trust_remote_code=True
@@ -60,61 +48,40 @@ def load_birefnet_model(device="cuda"):
         _birefnet_model.to(device)
         _birefnet_model.eval()
 
-        # 定義圖片預處理
         _birefnet_transform = transforms.Compose([
-            transforms.Resize((1024, 1024)), # BiRefNet 建議輸入大小
+            transforms.Resize((1024, 1024)),
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ])
     return _birefnet_model, _birefnet_transform
 
 def remove_background_birefnet(pil_image):
-    """
-    使用 BiRefNet 進行去背
-    輸入: PIL Image (RGB)
-    輸出: PIL Image (RGBA)
-    """
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model, transform = load_birefnet_model(device)
     
-    # 1. 紀錄原始尺寸
     w, h = pil_image.size
     
-    # 2. 預處理
     input_images = transform(pil_image).unsqueeze(0).to(device)
     
-    # 3. 推論
     with torch.no_grad():
         preds = model(input_images)[-1].sigmoid().cpu()
     
-    # 4. 後處理 Mask
-    # 將 Mask 縮放回原始尺寸
     pred = preds[0].squeeze()
     pred_pil = transforms.ToPILImage()(pred)
     pred_pil = pred_pil.resize((w, h), resample=Image.BILINEAR)
     
-    # 5. 合成
-    # 將 Mask 套用到原始圖片
     pil_image.putalpha(pred_pil)
     
     return pil_image
 
-# [新增] 輔助函數：建立棋盤格背景 (Checkerboard pattern)
 def create_checkerboard_pattern(h, w, square_size=8):
-    # 建立一個 HxW 的座標網格
     rows = torch.arange(h).unsqueeze(1).repeat(1, w)
     cols = torch.arange(w).unsqueeze(0).repeat(h, 1)
     
-    # 計算棋盤格紋理 (0 或 1 交錯)
     pattern = ((rows // square_size) + (cols // square_size)) % 2
-    
-    # [修改] 調整顏色計算公式以變更淺灰色
-    # 原本: pattern.float() * 0.5 + 0.5  => 結果是 0.5 (中灰) 和 1.0 (純白)
-    # 現在: pattern.float() * 0.15 + 0.85 => 結果是 0.85 (淺灰) 和 1.0 (純白)
-    # 您可以微調 0.85 這個基底值，越接近 1.0 灰色就越淺
+
     checkerboard = pattern.float() * 0.15 + 0.85
     
-    # 擴展為 RGB 三通道 (3, H, W)
     return checkerboard.unsqueeze(0).repeat(3, 1, 1)
 
 @torch.no_grad()
@@ -143,7 +110,7 @@ def main(args):
         inference_config = OmegaConf.load(model_config.get("inference_config", args.inference_config))
         unet = UNet3DConditionModel.from_pretrained_2d(args.pretrained_model_path, subfolder="unet", unet_additional_kwargs=OmegaConf.to_container(inference_config.unet_additional_kwargs)).cuda()
 
-        # load controlnet model (保持原邏輯)
+        # load controlnet model
         controlnet = controlnet_images = None
         if model_config.get("controlnet_path", "") != "":
             assert model_config.get("controlnet_images", "") != ""
@@ -241,20 +208,14 @@ def main(args):
             config[model_idx].random_seed.append(current_seed)
             print(f"current seed: {current_seed}")
 
-            # =========================================================
-            # [修改] 邏輯判定：是否需要進行圖層式生成 (Multi-Stage)
-            # 格式約定: "Foreground Prompt :: Background Prompt"
-            # =========================================================
             if " :: " in prompt:
                 print(f"Sampling with Layered Generation Mode...")
                 fg_prompt, bg_prompt = prompt.split(" :: ")
                 
-                # 1. 準備共用的 Latents (保證動態一致)
-                # Manually create latents to reuse
                 init_latents = torch.randn(
                     (1, 4, model_config.L, model_config.H // 8, model_config.W // 8),
                     generator=torch.Generator("cuda").manual_seed(current_seed),
-                    device="cuda", dtype=unet.dtype # 確保 dtype 一致
+                    device="cuda", dtype=unet.dtype
                 )
 
                 # 2. Stage 1: Generate Background & Record
@@ -267,15 +228,14 @@ def main(args):
                     width               = model_config.W,
                     height              = model_config.H,
                     video_length        = model_config.L,
-                    latents             = init_latents.clone(), # Clone
-                    attention_op_mode   = "record",             # <--- RECORD MODE
+                    latents             = init_latents.clone(),
+                    attention_op_mode   = "record",
                     
                     controlnet_images = controlnet_images,
                     controlnet_image_index = model_config.get("controlnet_image_indexs", [0]),
                 ).videos
 
                 # 3. Stage 2: Generate Foreground & Inject
-                # 強制加入黑色背景 Prompt 以便去背
                 fg_prompt_final = f"{fg_prompt}, {bg_prompt} background"
                 print(f"  [Stage 2] Generating Foreground: {fg_prompt_final}")
                 
@@ -287,94 +247,59 @@ def main(args):
                     width               = model_config.W,
                     height              = model_config.H,
                     video_length        = model_config.L,
-                    latents             = init_latents.clone(), # Reuse Latents
-                    attention_op_mode   = "inject",             # <--- INJECT MODE
+                    latents             = init_latents.clone(),
+                    attention_op_mode   = "inject",
                     
                     controlnet_images = controlnet_images,
                     controlnet_image_index = model_config.get("controlnet_image_indexs", [0]),
                 ).videos
 
-                # 4. Post-Process: Alpha Generation (使用 rembg)
-                print("  [Stage 3] Generating Alpha Mask with Rembg...")
+                # 4. Post-Process: Alpha Generation
+                print("  [Stage 3] Generating Alpha Mask...")
                 fg_video = fg_sample[0] # (3, L, H, W), value [0, 1]
                 
                 alpha_masks_list = []
                 
-                # rembg 只能處理單張圖片，所以我們對 L (Frames) 進行迴圈
                 for f in range(fg_video.shape[1]):
-                    # 4.1 轉為 PIL Image (需要先轉到 CPU, 調整維度, 轉為 uint8 0-255)
-                    # frame shape: (3, H, W) -> (H, W, 3)
                     frame_tensor = fg_video[:, f, :, :]
                     frame_np = frame_tensor.cpu().permute(1, 2, 0).numpy()
                     frame_np = (frame_np * 255).astype(np.uint8)
                     frame_pil = Image.fromarray(frame_np)
                     
-                    # 4.2 使用 rembg 去背
-                    # remove 會回傳 RGBA 圖片
-                    output_pil = remove_background_birefnet(frame_pil) # 新的 BiRefNet
+                    output_pil = remove_background_birefnet(frame_pil)
                     
-                    # 4.3 提取 Alpha Channel
-                    mask_pil = output_pil.split()[-1] # 取最後一個通道 (A)
+                    mask_pil = output_pil.split()[-1]
                     
-                    # 4.4 轉回 Tensor
-                    # ToTensor() 會自動將 0-255 轉回 0.0-1.0，形狀變成 (1, H, W)
                     mask_tensor = transforms.ToTensor()(mask_pil)
                     alpha_masks_list.append(mask_tensor)
-                
-                # 4.5 堆疊回 Video Tensor (1, L, H, W)
-                # stack on dim=1 (Time dimension)
+
                 alpha_mask = torch.stack(alpha_masks_list, dim=1).to(fg_video.device)
 
-                # 合成預覽: BG * (1-Alpha) + FG * Alpha
                 bg_video = bg_sample[0]
                 comp_video = bg_video * (1 - alpha_mask) + fg_video * alpha_mask
                 
-                # 最終 Sample 列表加入合成結果
                 sample = comp_video.unsqueeze(0) 
                 
-                # 額外儲存 debug 網格
-                debug_grid = torch.cat([bg_video, fg_video, alpha_mask.repeat(3,1,1,1), comp_video], dim=3) # 橫向拼接
+                debug_grid = torch.cat([bg_video, fg_video, alpha_mask.repeat(3,1,1,1), comp_video], dim=3)
                 save_videos_grid(debug_grid.unsqueeze(0), f"{savedir}/sample/{sample_idx}-{fg_prompt}-layered.gif")
 
-                # =========================================================
-                # [新增] 單獨儲存各個組件 (Component Saving)
-                # =========================================================
                 print(f"  [Stage 4] Saving individual components...")
                 base_name = f"{savedir}/sample/{sample_idx}-{fg_prompt}"
                 
-                # 1. Background
                 save_videos_grid(bg_video.unsqueeze(0), f"{base_name}-1-bg.gif")
-                
-                # 2. Foreground (純前景，不帶透明，背景是黑的)
                 save_videos_grid(fg_video.unsqueeze(0), f"{base_name}-2-fg.gif")
-                
-                # 3. Final Composite Output
                 save_videos_grid(comp_video.unsqueeze(0), f"{base_name}-4-composite.gif")
                 
-                # 4. Foreground * Mask (Transparent representation)
-                # 4a. 使用棋盤格背景 (Checkerboard)
-                # 製作棋盤格背景, 原始形狀: (3, H, W)
                 checkerboard = create_checkerboard_pattern(model_config.H, model_config.W).to(fg_video.device)
-                
-                # [FIX] 修正維度擴展邏輯
-                # 目標形狀: (Channel, Frames, Height, Width) -> (3, L, H, W)
-                # 1. unsqueeze(1) -> (3, 1, H, W)  (在 Channel 後面增加 Time 維度)
-                # 2. repeat -> (3, L, H, W)       (複製 Time 維度)
                 checkerboard = checkerboard.unsqueeze(1).repeat(1, model_config.L, 1, 1)
                 
-                # 合成: Checkerboard * (1 - Alpha) + FG * Alpha
-                # 現在 checkerboard, fg_video, alpha_mask 的維度都對齊了 (C, L, H, W)
                 fg_masked_grid = checkerboard * (1 - alpha_mask) + fg_video * alpha_mask
                 
                 save_videos_grid(fg_masked_grid.unsqueeze(0), f"{base_name}-3-fg_masked_grid.gif")
                 
-                # 4b. (Optional) 嘗試儲存帶有 RGBA 的 GIF 
-                # (注意: save_videos_grid 預設可能只支援 RGB，所以這裡手動處理)
                 try:
-                    # 組合 RGBA: (3, L, H, W) + (1, L, H, W) -> (4, L, H, W)
                     fg_rgba = torch.cat([fg_video, alpha_mask], dim=0) # (4, L, H, W)
                     
-                    # 轉為 List of PIL Images
                     fg_rgba = rearrange(fg_rgba, "c f h w -> f c h w")
                     pil_frames = []
                     for f in range(fg_rgba.shape[0]):
@@ -382,22 +307,18 @@ def main(args):
                         frame_np = (frame_np * 255).astype(np.uint8)
                         pil_frames.append(Image.fromarray(frame_np, mode="RGBA"))
                         
-                    # 儲存 GIF (保留透明度)
                     pil_frames[0].save(
                         f"{base_name}-3-fg_masked_rgba.gif",
                         save_all=True,
                         append_images=pil_frames[1:],
-                        duration=100, # 假設 10fps
+                        duration=100,
                         loop=0,
-                        disposal=2 # 清除上一幀，這對透明 GIF 很重要
+                        disposal=2
                     )
                 except Exception as e:
                     print(f"Failed to save RGBA GIF: {e}")
 
             else:
-                # =========================================================
-                # 一般生成模式 (Original Logic)
-                # =========================================================
                 print(f"sampling {prompt} ...")
                 sample = pipeline(
                     prompt,
