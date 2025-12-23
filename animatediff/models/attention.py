@@ -108,6 +108,42 @@ class ReferenceCrossAttention(CrossAttention):
         return hidden_states
 
 
+class SparseCausalAttention2D(CrossAttention):
+    """Causal self-attention across frames with a simple sparse mask."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+    def forward(self, hidden_states, encoder_hidden_states=None, attention_mask=None, video_length=None, **kwargs):
+        # If this is cross-attention or no video length is provided, fall back to default behavior.
+        if encoder_hidden_states is not None or video_length is None:
+            return super().forward(hidden_states, encoder_hidden_states=encoder_hidden_states, attention_mask=attention_mask)
+
+        b_f, seq_len, _ = hidden_states.shape
+        if video_length <= 0 or b_f % video_length != 0:
+            return super().forward(hidden_states, encoder_hidden_states=encoder_hidden_states, attention_mask=attention_mask)
+
+        batch = b_f // video_length
+        device = hidden_states.device
+        dtype = hidden_states.dtype
+
+        # Merge frames into sequence so each token position has a frame id for causal masking.
+        hidden_states_merged = rearrange(hidden_states, "(b f) t c -> b (f t) c", b=batch, f=video_length)
+        total_tokens = hidden_states_merged.shape[1]
+
+        frame_ids = torch.arange(video_length, device=device).repeat_interleave(seq_len)
+        allow = frame_ids.unsqueeze(0) >= frame_ids.unsqueeze(1)
+        mask_value = torch.finfo(dtype).min
+        causal_mask = torch.where(allow, torch.zeros_like(allow, dtype=dtype), torch.full_like(allow, mask_value, dtype=dtype))
+        causal_mask = causal_mask.unsqueeze(0).unsqueeze(1).repeat(batch, 1, 1, 1)
+
+        attn_mask = causal_mask if attention_mask is None else attention_mask + causal_mask
+
+        attended = super().forward(hidden_states_merged, encoder_hidden_states=None, attention_mask=attn_mask)
+        attended = rearrange(attended, "b (f t) c -> (b f) t c", f=video_length)
+        return attended
+
+
 class Transformer3DModel(ModelMixin, ConfigMixin):
     @register_to_config
     def __init__(
@@ -127,6 +163,7 @@ class Transformer3DModel(ModelMixin, ConfigMixin):
         upcast_attention: bool = False,
         unet_use_cross_frame_attention=None,
         unet_use_temporal_attention=None,
+        attention_op_mode: str = "kvcache",
     ):
         super().__init__()
         self.use_linear_projection = use_linear_projection
@@ -157,6 +194,7 @@ class Transformer3DModel(ModelMixin, ConfigMixin):
                     upcast_attention=upcast_attention,
                     unet_use_cross_frame_attention=unet_use_cross_frame_attention,
                     unet_use_temporal_attention=unet_use_temporal_attention,
+                    attention_op_mode=attention_op_mode,
                 )
                 for _ in range(num_layers)
             ]
@@ -224,21 +262,25 @@ class BasicTransformerBlock(nn.Module):
         upcast_attention: bool = False,
         unet_use_cross_frame_attention=None,
         unet_use_temporal_attention=None,
+        attention_op_mode: str = "kvcache",
     ):
         super().__init__()
         self.only_cross_attention = only_cross_attention
         self.use_ada_layer_norm = num_embeds_ada_norm is not None
         self.unet_use_cross_frame_attention = unet_use_cross_frame_attention
         self.unet_use_temporal_attention = unet_use_temporal_attention
+        self.attention_op_mode = attention_op_mode
+
+        attn_cls = SparseCausalAttention2D if attention_op_mode == "mask" else ReferenceCrossAttention
 
         if unet_use_cross_frame_attention:
-            self.attn1 = ReferenceCrossAttention(
+            self.attn1 = attn_cls(
                 query_dim=dim, heads=num_attention_heads, dim_head=attention_head_dim, dropout=dropout,
                 bias=attention_bias, cross_attention_dim=cross_attention_dim if only_cross_attention else None,
                 upcast_attention=upcast_attention,
             )
         else:
-            self.attn1 = ReferenceCrossAttention(
+            self.attn1 = attn_cls(
                 query_dim=dim, heads=num_attention_heads, dim_head=attention_head_dim, dropout=dropout,
                 bias=attention_bias, upcast_attention=upcast_attention,
             )
@@ -271,7 +313,8 @@ class BasicTransformerBlock(nn.Module):
         if not is_xformers_available():
             raise ModuleNotFoundError("xformers not found")
         
-        self.attn1._use_memory_efficient_attention_xformers = use_memory_efficient_attention_xformers
+        if hasattr(self.attn1, "_use_memory_efficient_attention_xformers"):
+            self.attn1._use_memory_efficient_attention_xformers = use_memory_efficient_attention_xformers
         if self.attn2 is not None:
             self.attn2._use_memory_efficient_attention_xformers = use_memory_efficient_attention_xformers
 
@@ -279,10 +322,11 @@ class BasicTransformerBlock(nn.Module):
         # 1. Self-Attn
         norm_hidden_states_1 = self.norm1(hidden_states, timestep) if self.use_ada_layer_norm else self.norm1(hidden_states)
         
-        if self.unet_use_cross_frame_attention:
-            hidden_states = self.attn1(norm_hidden_states_1, attention_mask=attention_mask, video_length=video_length) + hidden_states
-        else:
-            hidden_states = self.attn1(norm_hidden_states_1, attention_mask=attention_mask) + hidden_states
+        hidden_states = self.attn1(
+            norm_hidden_states_1,
+            attention_mask=attention_mask,
+            video_length=video_length,
+        ) + hidden_states
 
         # 2. Cross-Attn (Text)
         if self.attn2 is not None:

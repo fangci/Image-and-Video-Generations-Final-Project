@@ -4,6 +4,7 @@ unet_additional_kwargs:
   motion_module_resolutions:  [1,2,4,8]
   motion_module_mid_block:    true
   motion_module_type:         "Vanilla"
+  attention_op_mode:          "kvcache"  # Options: "kvcache" (default), "mask"  [ADDED] for separate branches
 
   motion_module_kwargs:
     num_attention_heads:        8

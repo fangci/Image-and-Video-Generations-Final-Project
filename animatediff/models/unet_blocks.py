@@ -31,6 +31,7 @@ def get_down_block(
     unet_use_cross_frame_attention=False,
     unet_use_temporal_attention=False,
     use_inflated_groupnorm=False,
+    attention_op_mode="kvcache",
 
     use_motion_module=None,
     
@@ -81,6 +82,7 @@ def get_down_block(
             unet_use_cross_frame_attention=unet_use_cross_frame_attention,
             unet_use_temporal_attention=unet_use_temporal_attention,
             use_inflated_groupnorm=use_inflated_groupnorm,
+            attention_op_mode=attention_op_mode,
             
             use_motion_module=use_motion_module,
             motion_module_type=motion_module_type,
@@ -111,6 +113,7 @@ def get_up_block(
     unet_use_cross_frame_attention=False,
     unet_use_temporal_attention=False,
     use_inflated_groupnorm=False,
+    attention_op_mode="kvcache",
     
     use_motion_module=None,
     motion_module_type=None,
@@ -160,6 +163,7 @@ def get_up_block(
             unet_use_cross_frame_attention=unet_use_cross_frame_attention,
             unet_use_temporal_attention=unet_use_temporal_attention,
             use_inflated_groupnorm=use_inflated_groupnorm,
+            attention_op_mode=attention_op_mode,
 
             use_motion_module=use_motion_module,
             motion_module_type=motion_module_type,
@@ -190,6 +194,7 @@ class UNetMidBlock3DCrossAttn(nn.Module):
         unet_use_cross_frame_attention=False,
         unet_use_temporal_attention=False,
         use_inflated_groupnorm=False,
+        attention_op_mode="kvcache",
 
         use_motion_module=None,
         
@@ -238,6 +243,7 @@ class UNetMidBlock3DCrossAttn(nn.Module):
 
                     unet_use_cross_frame_attention=unet_use_cross_frame_attention,
                     unet_use_temporal_attention=unet_use_temporal_attention,
+                    attention_op_mode=attention_op_mode,
                 )
             )
             motion_modules.append(
@@ -304,6 +310,7 @@ class CrossAttnDownBlock3D(nn.Module):
         unet_use_cross_frame_attention=False,
         unet_use_temporal_attention=False,
         use_inflated_groupnorm=False,
+        attention_op_mode="kvcache",
         
         use_motion_module=None,
 
@@ -352,6 +359,7 @@ class CrossAttnDownBlock3D(nn.Module):
 
                     unet_use_cross_frame_attention=unet_use_cross_frame_attention,
                     unet_use_temporal_attention=unet_use_temporal_attention,
+                    attention_op_mode=attention_op_mode,
                 )
             )
             motion_modules.append(
@@ -552,6 +560,7 @@ class CrossAttnUpBlock3D(nn.Module):
 
         motion_module_type=None,
         motion_module_kwargs=None,
+        attention_op_mode: str = "kvcache",
     ):
         super().__init__()
         resnets = []
@@ -597,6 +606,7 @@ class CrossAttnUpBlock3D(nn.Module):
 
                     unet_use_cross_frame_attention=unet_use_cross_frame_attention,
                     unet_use_temporal_attention=unet_use_temporal_attention,
+                    attention_op_mode=attention_op_mode,
                 )
             )
             motion_modules.append(

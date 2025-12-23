@@ -88,6 +88,7 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin):
         motion_module_kwargs           = {},
         unet_use_cross_frame_attention = False,
         unet_use_temporal_attention    = False,
+        attention_op_mode              = "kvcache",
     ):
         super().__init__()
         
@@ -153,6 +154,7 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin):
                 unet_use_cross_frame_attention=unet_use_cross_frame_attention,
                 unet_use_temporal_attention=unet_use_temporal_attention,
                 use_inflated_groupnorm=use_inflated_groupnorm,
+                attention_op_mode=attention_op_mode,
                 
                 use_motion_module=use_motion_module and (res in motion_module_resolutions) and (not motion_module_decoder_only),
                 motion_module_type=motion_module_type,
@@ -179,6 +181,7 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin):
                 unet_use_cross_frame_attention=unet_use_cross_frame_attention,
                 unet_use_temporal_attention=unet_use_temporal_attention,
                 use_inflated_groupnorm=use_inflated_groupnorm,
+                attention_op_mode=attention_op_mode,
                 
                 use_motion_module=use_motion_module and motion_module_mid_block,
                 motion_module_type=motion_module_type,
@@ -232,6 +235,7 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin):
                 unet_use_cross_frame_attention=unet_use_cross_frame_attention,
                 unet_use_temporal_attention=unet_use_temporal_attention,
                 use_inflated_groupnorm=use_inflated_groupnorm,
+                attention_op_mode=attention_op_mode,
 
                 use_motion_module=use_motion_module and (res in motion_module_resolutions),
                 motion_module_type=motion_module_type,
