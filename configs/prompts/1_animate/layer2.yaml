@@ -1,0 +1,15 @@
+# motion module v3
+- dreambooth_path: "models/DreamBooth_LoRA/toonyou_beta3.safetensors"
+  lora_model_path: ""
+
+  inference_config: "configs/inference/inference-v3.yaml"
+  motion_module: "models/Motion_Module/v3_sd15_mm.ckpt"
+
+  seed: [12192490710448890259, 12238800062118732365, 13226337751639812613, 16431231374396590344]
+  steps: 25
+  guidance_scale: 7.5
+
+  prompt:
+    - "1girl, white dress, face :: sunrise, beach, high quality"
+  n_prompt:
+    - "worst quality, low quality, letterboxed"

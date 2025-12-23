@@ -1,0 +1,17 @@
+# motion module v1_14
+- dreambooth_path: "models/DreamBooth_LoRA/majicmixRealistic_v4.safetensors"
+  lora_model_path: "models/DreamBooth_LoRA/leosamsFilmgirlUltra_velvia20Lora.safetensors"
+  lora_alpha: 0.6
+
+  inference_config: "configs/inference/inference-v3.yaml"
+  motion_module: "models/Motion_Module/v3_sd15_mm.ckpt"
+
+  seed: [5726977427157971918, 18368660165286593270, 9350384325017735240, 2097615141377450078]
+  steps: 25
+  guidance_scale: 8
+
+  prompt:
+    - "a woman looking at the viewer, red coat, clear face, calm expression :: city traffic background, motion blur, cinematic lighting"
+
+  n_prompt:
+    - "cartoon, anime, sketches,worst quality, low quality, deformed, distorted, disfigured, bad eyes, wrong lips, weird mouth, bad teeth, mutated hands and fingers, bad anatomy, wrong anatomy, amputation, extra limb, missing limb, floating limbs, disconnected limbs, mutation, ugly, disgusting, bad_pictures, negative_hand-neg"

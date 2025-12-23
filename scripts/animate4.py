@@ -140,49 +140,7 @@ def main(args):
 
         if is_xformers_available() and (not args.without_xformers):
             unet.enable_xformers_memory_efficient_attention()
-            if controlnet is not None: controlnet.enable_xformers_memory_efficient_attention()
 
-        mask_path = model_config.get("mask_path", "")
-        latents_mask = None
-
-        if mask_path != "":
-            # 1. 讀取遮罩圖片並轉為灰階 (L)
-            mask_img = Image.open(mask_path).convert("L")
-            
-            # 2. 定義遮罩的 Resize 尺寸 (必須是 Latent 空間大小，即原圖 H/8, W/8)
-            latent_h, latent_w = model_config.H // 8, model_config.W // 8
-            
-            # 3. 轉換與 Resize
-            mask_transforms = transforms.Compose([
-                transforms.Resize((latent_h, latent_w), interpolation=transforms.InterpolationMode.NEAREST),
-                transforms.ToTensor(),
-            ])
-            
-            # 4. 處理後的遮罩張量 [1, 1, latent_h, latent_w]
-            latents_mask = mask_transforms(mask_img).unsqueeze(0)
-            latents_mask = (latents_mask > 0.5).float().cuda()
-            
-            # 5. 擴展到視頻長度 [1, 1, video_length, latent_h, latent_w]
-            latents_mask = repeat(latents_mask, "b c h w -> b c f h w", f=model_config.L)
-
-        reference_latents = None
-        ref_image_path = model_config.get("reference_image_path", "") # 或是用第一張 controlnet 圖
-
-        if ref_image_path != "":
-            ref_img = Image.open(ref_image_path).convert("RGB")
-            ref_transforms = transforms.Compose([
-                transforms.Resize((model_config.H, model_config.W)),
-                transforms.ToTensor(),
-                transforms.Normalize([0.5], [0.5])
-            ])
-            ref_tensor = ref_transforms(ref_img).unsqueeze(0).cuda() # [1, 3, H, W]
-            
-            # 使用 VAE 將參考圖轉為 Latent
-            with torch.no_grad():
-                reference_latents = vae.encode(ref_tensor).latent_dist.sample() * 0.18215
-                # 擴展到視頻長度 [1, 4, video_length, latent_h, latent_w]
-                reference_latents = repeat(reference_latents, "b c h w -> b c f h w", f=model_config.L)
-        
         pipeline = AnimationPipeline(
             vae=vae, text_encoder=text_encoder, tokenizer=tokenizer, unet=unet,
             controlnet=None,

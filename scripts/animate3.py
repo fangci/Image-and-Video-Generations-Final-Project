@@ -51,7 +51,7 @@ def encode_video_to_latents(video_tensor, vae):
 @torch.no_grad()
 def run_denoising_loop(pipeline, prompt, n_prompt, latents, guidance_scale, video_length):
     """
-    執行 Pipeline 的後半段去噪過程 (Final Generation)。
+    執行 Pipeline 的去噪過程 (支援從中間 Step 開始)。
     """
     vae = pipeline.vae
     device = pipeline.device
@@ -70,12 +70,12 @@ def run_denoising_loop(pipeline, prompt, n_prompt, latents, guidance_scale, vide
     context = torch.cat([uncond_embeddings, text_embeddings])
     
     # 2. Denoising Loop
-    # 注意：這裡直接使用 scheduler.timesteps，這些 steps 必須在外部 (main) 設定好
+    # 注意：這裡直接使用 scheduler.timesteps，這些 steps 必須在外部設定好
     timesteps = scheduler.timesteps
     
     current_latents = latents.clone()
     
-    for t in tqdm(timesteps, desc=f"Final Gen: {prompt[:10]}..."):
+    for t in tqdm(timesteps, desc=f"Gen ({prompt[:10]}...):"):
         # Expand latents for CFG
         latent_model_input = torch.cat([current_latents] * 2)
         latent_model_input = scheduler.scale_model_input(latent_model_input, t)
@@ -124,10 +124,14 @@ def main(args):
     text_encoder = CLIPTextModel.from_pretrained(args.pretrained_model_path, subfolder="text_encoder").cuda()
     vae          = AutoencoderKL.from_pretrained(args.pretrained_model_path, subfolder="vae").cuda()
 
-    # 設定重繪強度 (Denoising Strength)
-    # 這次因為是拼接好的圖，我們希望保留多一點結構，但也需要足夠的強度來融合
-    # 建議 0.5 - 0.7
-    denoising_strength = getattr(args, "strength", 0.6)
+    # --- 參數設定 ---
+    # Final Denoising Strength (Step 5)
+    denoising_strength = getattr(args, "strength", 0.65)
+    
+    # [NEW] FG Init Strength (Step 1b): FG 生成時要破壞多少 BG 的結構
+    # 建議 0.85 - 0.95。
+    # 如果太低(如 0.6)，FG 會長得像 BG；如果 1.0，則完全隨機(等於原本的方法)
+    strength_fg_init = getattr(args, "strength_fg_init", 0.85)
 
     sample_idx = 0
     for model_idx, model_config in enumerate(config):
@@ -140,49 +144,7 @@ def main(args):
 
         if is_xformers_available() and (not args.without_xformers):
             unet.enable_xformers_memory_efficient_attention()
-            if controlnet is not None: controlnet.enable_xformers_memory_efficient_attention()
 
-        mask_path = model_config.get("mask_path", "")
-        latents_mask = None
-
-        if mask_path != "":
-            # 1. 讀取遮罩圖片並轉為灰階 (L)
-            mask_img = Image.open(mask_path).convert("L")
-            
-            # 2. 定義遮罩的 Resize 尺寸 (必須是 Latent 空間大小，即原圖 H/8, W/8)
-            latent_h, latent_w = model_config.H // 8, model_config.W // 8
-            
-            # 3. 轉換與 Resize
-            mask_transforms = transforms.Compose([
-                transforms.Resize((latent_h, latent_w), interpolation=transforms.InterpolationMode.NEAREST),
-                transforms.ToTensor(),
-            ])
-            
-            # 4. 處理後的遮罩張量 [1, 1, latent_h, latent_w]
-            latents_mask = mask_transforms(mask_img).unsqueeze(0)
-            latents_mask = (latents_mask > 0.5).float().cuda()
-            
-            # 5. 擴展到視頻長度 [1, 1, video_length, latent_h, latent_w]
-            latents_mask = repeat(latents_mask, "b c h w -> b c f h w", f=model_config.L)
-
-        reference_latents = None
-        ref_image_path = model_config.get("reference_image_path", "") # 或是用第一張 controlnet 圖
-
-        if ref_image_path != "":
-            ref_img = Image.open(ref_image_path).convert("RGB")
-            ref_transforms = transforms.Compose([
-                transforms.Resize((model_config.H, model_config.W)),
-                transforms.ToTensor(),
-                transforms.Normalize([0.5], [0.5])
-            ])
-            ref_tensor = ref_transforms(ref_img).unsqueeze(0).cuda() # [1, 3, H, W]
-            
-            # 使用 VAE 將參考圖轉為 Latent
-            with torch.no_grad():
-                reference_latents = vae.encode(ref_tensor).latent_dist.sample() * 0.18215
-                # 擴展到視頻長度 [1, 4, video_length, latent_h, latent_w]
-                reference_latents = repeat(reference_latents, "b c h w -> b c f h w", f=model_config.L)
-        
         pipeline = AnimationPipeline(
             vae=vae, text_encoder=text_encoder, tokenizer=tokenizer, unet=unet,
             controlnet=None,
@@ -223,11 +185,8 @@ def main(args):
             config[model_idx].random_seed.append(current_seed)
             
             # ==========================================
-            # Step 1: Generate Separate BG and FG Drafts
+            # Step 1a: Generate BG Draft
             # ==========================================
-            # 為了讓兩者動作盡量一致，我們使用相同的 Seed 生成
-            
-            # 1a. Background Draft
             print(f"--- Step 1a: Generating BG Draft ---")
             torch.manual_seed(current_seed)
             bg_draft = pipeline(
@@ -241,68 +200,74 @@ def main(args):
             ).videos
             save_videos_grid(bg_draft, f"{savedir}/sample/{sample_idx}-1a_bg_draft.gif")
             
-            # 1b. Foreground Draft
-            print(f"--- Step 1b: Generating FG Draft ---")
+            # ==========================================
+            # [MODIFIED] Step 1b: Generate FG Draft (From Noisy BG)
+            # ==========================================
+            print(f"--- Step 1b: Generating FG Draft (Initialized from BG) ---")
+            
+            # 1. Encode BG to Latents
+            bg_latents = encode_video_to_latents(bg_draft.cuda(), vae)
+            
+            # 2. Add Noise to BG (create initial state for FG)
+            pipeline.scheduler.set_timesteps(model_config.steps)
+            t_start_fg_idx = int(len(pipeline.scheduler.timesteps) * (1 - strength_fg_init))
+            t_start_fg = pipeline.scheduler.timesteps[t_start_fg_idx]
+            
+            torch.manual_seed(current_seed) # 保持 Seed 一致
+            noise = torch.randn_like(bg_latents)
+            noisy_bg_latents = pipeline.scheduler.add_noise(bg_latents, noise, t_start_fg)
+            
+            # 3. Generate FG using Denoising Loop
+            # 設定 Scheduler 只跑剩下的部分
+            full_timesteps = pipeline.scheduler.timesteps
+            pipeline.scheduler.timesteps = full_timesteps[t_start_fg_idx:]
+            
             torch.manual_seed(current_seed)
-            fg_draft = pipeline(
-                prompt = fg_prompt,
-                negative_prompt = n_prompt,
-                num_inference_steps = model_config.steps,
-                guidance_scale = model_config.guidance_scale,
-                width = model_config.W,
-                height = model_config.H,
-                video_length = model_config.L,
-            ).videos
-            save_videos_grid(fg_draft, f"{savedir}/sample/{sample_idx}-1b_fg_draft.gif")
+            fg_draft = run_denoising_loop(
+                pipeline,
+                prompt=fg_prompt, # 使用前景 Prompt
+                n_prompt=n_prompt,
+                latents=noisy_bg_latents, # 從加噪後的 BG 開始
+                guidance_scale=model_config.guidance_scale,
+                video_length=model_config.L
+            )
+            save_videos_grid(fg_draft.cpu(), f"{savedir}/sample/{sample_idx}-1b_fg_draft.gif")
 
             # ==========================================
             # Step 2: Generate Mask from FG
             # ==========================================
             print(f"--- Step 2: Generating Mask from FG ---")
             generated_mask = auto_masker.generate_mask_from_video_tensor(fg_draft)
-            
-            # Save Mask
-            save_videos_grid(generated_mask.unsqueeze(1).repeat(1, 3, 1, 1, 1), f"{savedir}/sample/{sample_idx}-2_mask.gif")
+            save_videos_grid(generated_mask.unsqueeze(1).repeat(1, 3, 1, 1, 1).cpu(), f"{savedir}/sample/{sample_idx}-2_mask.gif")
 
             # ==========================================
             # Step 3: Composite (Collage)
             # ==========================================
             print(f"--- Step 3: Compositing (Collage) ---")
-            
             mask_expanded = generated_mask.unsqueeze(1) # [b, 1, f, h, w]
             
-            # Composite Logic: FG * Mask + BG * (1 - Mask)
-            # 確保都在同一 device
             fg_draft = fg_draft.to(pipeline.device)
             bg_draft = bg_draft.to(pipeline.device)
             mask_expanded = mask_expanded.to(pipeline.device)
             
             composite_video = fg_draft * mask_expanded + bg_draft * (1.0 - mask_expanded)
-            
             save_videos_grid(composite_video.cpu(), f"{savedir}/sample/{sample_idx}-3_composite.gif")
 
             # ==========================================
-            # Step 4: Add Noise (Prepare for SDEdit)
+            # Step 4: Add Noise to Composite
             # ==========================================
             print(f"--- Step 4: Adding Noise to Composite ---")
-            
-            # 4.1 Encode Composite to Latents
             init_latents = encode_video_to_latents(composite_video, vae)
             
-            # 4.2 Setup Scheduler
             pipeline.scheduler.set_timesteps(model_config.steps)
-            
-            # 計算開始的 Step
             t_start_index = int(len(pipeline.scheduler.timesteps) * (1 - denoising_strength))
             t_start = pipeline.scheduler.timesteps[t_start_index]
             
-            # 4.3 Add Noise
-            # 使用與 Draft 相同的 Seed 來加噪，這有助於讓原本的細節更好地保留在 Latent 中
             torch.manual_seed(current_seed)
             noise = torch.randn_like(init_latents)
             noisy_latents = pipeline.scheduler.add_noise(init_latents, noise, t_start)
             
-            # 4.4 Visualize Noisy Latents
+            # Visualize Noisy Input
             with torch.no_grad():
                 temp_latents = 1 / 0.18215 * noisy_latents
                 temp_latents = rearrange(temp_latents, "b c f h w -> (b f) c h w")
@@ -312,19 +277,15 @@ def main(args):
                 save_videos_grid(noisy_vis.cpu(), f"{savedir}/sample/{sample_idx}-4_noisy_input.gif")
 
             # ==========================================
-            # Step 5: Final Generation (Denoise from Composite)
+            # Step 5: Final Generation
             # ==========================================
             print(f"--- Step 5: Final Generation (Harmonizing) ---")
-            
-            # 準備 Scheduler Timesteps (只跑剩下的部分)
-            full_timesteps = pipeline.scheduler.timesteps
-            final_timesteps = full_timesteps[t_start_index:]
-            pipeline.scheduler.timesteps = final_timesteps
+            pipeline.scheduler.timesteps = full_timesteps[t_start_index:]
             
             torch.manual_seed(current_seed)
             final_output = run_denoising_loop(
                 pipeline,
-                prompt=combined_prompt_str, # 使用完整的 Prompt (如 "candle in a room")
+                prompt=combined_prompt_str,
                 n_prompt=n_prompt,
                 latents=noisy_latents,
                 guidance_scale=model_config.guidance_scale,
@@ -351,7 +312,13 @@ if __name__ == "__main__":
     parser.add_argument("--L", type=int, default=16 )
     parser.add_argument("--W", type=int, default=256)
     parser.add_argument("--H", type=int, default=256)
-    parser.add_argument("--strength", type=float, default=0.65, help="Denoising strength (0.5-0.8 recommended).")
+    
+    # Final Fusion Strength
+    parser.add_argument("--strength", type=float, default=0.1, help="Final fusion strength.")
+    
+    # FG Generation Strength (from BG)
+    parser.add_argument("--strength_fg_init", type=float, default=0.8, help="Strength for FG generation from BG. Higher = less like BG.")
+    
     parser.add_argument("--without-xformers", action="store_true")
     args = parser.parse_args()
     main(args)

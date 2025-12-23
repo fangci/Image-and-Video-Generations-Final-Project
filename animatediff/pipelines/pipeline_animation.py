@@ -31,7 +31,9 @@ from ..models.unet import UNet3DConditionModel
 from ..models.sparse_controlnet import SparseControlNetModel
 import pdb
 
-logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
+from ..models.attention import SharedAttentionState
+
+logger = logging.get_logger(__name__)
 
 
 @dataclass
@@ -340,12 +342,12 @@ class AnimationPipeline(DiffusionPipeline):
         controlnet_image_index: list = [0],
         controlnet_conditioning_scale: Union[float, List[float]] = 1.0,
 
-        # --- 新增參數 ---
-        latents_mask: Optional[torch.FloatTensor] = None, # 遮罩: 1代表要動, 0代表不動
-        reference_latents: Optional[torch.FloatTensor] = None, # 參考幀或原始影片的 latents
+        latents_mask: Optional[torch.FloatTensor] = None,
+        reference_latents: Optional[torch.FloatTensor] = None,
         reference_eps: Optional[List[torch.FloatTensor]] = None,
         cache_reference_eps: bool = False,
-        # ----------------
+        
+        attention_op_mode: str = "normal",
 
         **kwargs,
     ):
@@ -397,6 +399,9 @@ class AnimationPipeline(DiffusionPipeline):
         )
         latents_dtype = latents.dtype
 
+        attn_state = SharedAttentionState.get_instance()
+        attn_state.set_mode(attention_op_mode)
+
         # Prepare extra step kwargs.
         extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
 
@@ -407,6 +412,9 @@ class AnimationPipeline(DiffusionPipeline):
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
                 
+                if attention_op_mode != "normal":
+                    attn_state.counter = 0
+
                 # # background masking
                 if latents_mask is not None and reference_latents is not None:
                     mask = latents_mask.to(latents.device, latents.dtype)
@@ -502,14 +510,11 @@ class AnimationPipeline(DiffusionPipeline):
                     noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
                     noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
                 
-                # --------- 新增：cache reference eps ---------
                 if cache_reference_eps:
                     cached_reference_eps.append(noise_pred.detach())
-                # ------------------------------------------------  
                 if latents_mask is not None and reference_eps is not None:
                     mask = latents_mask.to(noise_pred.device, noise_pred.dtype)
 
-                    # early–mid steps 才鎖 background
                     step_ratio = i / len(timesteps)
                     if step_ratio < 0.7:
                         eps_bg = reference_eps[i].to(noise_pred.device, noise_pred.dtype)
@@ -524,10 +529,9 @@ class AnimationPipeline(DiffusionPipeline):
                     if callback is not None and i % callback_steps == 0:
                         callback(i, t, latents)
 
-        # Post-processing
+        attn_state.reset()
         video = self.decode_latents(latents)
 
-        # Convert to tensor
         if output_type == "tensor":
             video = torch.from_numpy(video)
 
