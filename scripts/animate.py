@@ -145,6 +145,53 @@ def main(args):
         random_seeds = [random_seeds] if isinstance(random_seeds, int) else list(random_seeds)
         random_seeds = random_seeds * len(prompts) if len(random_seeds) == 1 else random_seeds
         
+        # VIBID parameters
+        enable_vibid = model_config.get("enable_vibid", False)
+        input_start_image = None
+        input_end_image = None
+        
+        if enable_vibid:
+            start_image_path = model_config.get("start_image_path", None)
+            end_image_path = model_config.get("end_image_path", None)
+            
+            # Load start image
+            if start_image_path is not None:
+                print(f"Loading start image from {start_image_path} for VIBID")
+                image_transforms = transforms.Compose([
+                    transforms.Resize((model_config.H, model_config.W)),
+                    transforms.ToTensor(),
+                ])
+                start_image = Image.open(start_image_path).convert("RGB")
+                input_start_image = image_transforms(start_image).unsqueeze(0).cuda()
+                # Normalize to [-1, 1] for VAE
+                input_start_image = input_start_image * 2.0 - 1.0
+                
+                # Save start image for reference
+                os.makedirs(os.path.join(savedir, "vibid_images"), exist_ok=True)
+                start_image.resize((model_config.W, model_config.H)).save(f"{savedir}/vibid_images/start_frame.png")
+            else:
+                print("WARNING: enable_vibid is True but start_image_path is not provided!")
+                enable_vibid = False
+            
+            # Load end image
+            if end_image_path is not None:
+                print(f"Loading end image from {end_image_path} for VIBID")
+                image_transforms = transforms.Compose([
+                    transforms.Resize((model_config.H, model_config.W)),
+                    transforms.ToTensor(),
+                ])
+                end_image = Image.open(end_image_path).convert("RGB")
+                input_end_image = image_transforms(end_image).unsqueeze(0).cuda()
+                # Normalize to [-1, 1] for VAE
+                input_end_image = input_end_image * 2.0 - 1.0
+                
+                # Save end image for reference
+                os.makedirs(os.path.join(savedir, "vibid_images"), exist_ok=True)
+                end_image.resize((model_config.W, model_config.H)).save(f"{savedir}/vibid_images/end_frame.png")
+            else:
+                print("WARNING: enable_vibid is True but end_image_path is not provided!")
+                enable_vibid = False
+        
         config[model_idx].random_seed = []
         for prompt_idx, (prompt, n_prompt, random_seed) in enumerate(zip(prompts, n_prompts, random_seeds)):
             
@@ -155,18 +202,30 @@ def main(args):
             
             print(f"current seed: {torch.initial_seed()}")
             print(f"sampling {prompt} ...")
-            sample = pipeline(
-                prompt,
-                negative_prompt     = n_prompt,
-                num_inference_steps = model_config.steps,
-                guidance_scale      = model_config.guidance_scale,
-                width               = model_config.W,
-                height              = model_config.H,
-                video_length        = model_config.L,
-
-                controlnet_images = controlnet_images,
-                controlnet_image_index = model_config.get("controlnet_image_indexs", [0]),
-            ).videos
+            
+            # Prepare pipeline arguments
+            pipeline_args = {
+                "prompt": prompt,
+                "negative_prompt": n_prompt,
+                "num_inference_steps": model_config.steps,
+                "guidance_scale": model_config.guidance_scale,
+                "width": model_config.W,
+                "height": model_config.H,
+                "video_length": model_config.L,
+                "controlnet_images": controlnet_images,
+                "controlnet_image_index": model_config.get("controlnet_image_indexs", [0]),
+            }
+            
+            # Add VIBID parameters if enabled
+            if enable_vibid:
+                pipeline_args["enable_vibid"] = True
+                pipeline_args["input_start_image"] = input_start_image
+                pipeline_args["input_end_image"] = input_end_image
+                pipeline_args["cfg_scale_flip"] = model_config.get("cfg_scale_flip", 1.0)
+                pipeline_args["n_inner"] = model_config.get("n_inner", 5)
+                print(f"VIBID enabled: cfg_scale_flip={pipeline_args['cfg_scale_flip']}, n_inner={pipeline_args['n_inner']}")
+            
+            sample = pipeline(**pipeline_args).videos
             samples.append(sample)
 
             prompt = "-".join((prompt.replace("/", "").split(" ")[:10]))

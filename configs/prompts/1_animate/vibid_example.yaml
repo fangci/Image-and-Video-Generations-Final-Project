@@ -1,0 +1,25 @@
+# VIBID Bidirectional Video Generation Example
+# This configuration enables VIBID mode for consistent start-to-end video generation
+
+- dreambooth_path: "models/DreamBooth_LoRA/realisticVisionV60B1_v51VAE.safetensors"
+  lora_model_path: ""
+
+  inference_config: "configs/inference/inference-v3.yaml"
+  motion_module: "models/Motion_Module/v3_sd15_mm.ckpt"
+
+  # VIBID specific parameters
+  enable_vibid: True
+  start_image_path: "__assets__/test/1.jpg"  # 修改為你的起始圖片路徑
+  end_image_path: "__assets__/test/2.jpg"  # 修改為你的結尾圖片路徑
+  cfg_scale_flip: 3.0  # CFG scale for backward pass
+  n_inner: 5  # Number of conjugate gradient iterations
+
+  seed: [42]
+  steps: 100
+  guidance_scale: 5.0
+
+  prompt:
+    - "A colorful hot air balloon taking off in the blue sky."
+
+  n_prompt:
+    - "semi-realistic, cgi, 3d, render, sketch, cartoon, drawing, anime, text, close up, cropped, out of frame, worst quality, low quality, jpeg artifacts, ugly, duplicate, morbid, mutilated, extra fingers, mutated hands, poorly drawn hands, poorly drawn face, mutation, deformed, blurry, dehydrated, bad anatomy, bad proportions, extra limbs, cloned face, disfigured, gross proportions, malformed limbs, missing arms, missing legs, extra arms, extra legs, fused fingers, too many fingers, long neck"

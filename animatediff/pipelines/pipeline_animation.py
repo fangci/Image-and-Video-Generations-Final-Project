@@ -315,6 +315,54 @@ class AnimationPipeline(DiffusionPipeline):
         latents = latents * self.scheduler.init_noise_sigma
         return latents
 
+    def append_dims(self, x, target_dims):
+        """Append dimensions to the end of a tensor until it has target_dims dimensions."""
+        dims_to_append = target_dims - x.ndim
+        if dims_to_append < 0:
+            raise ValueError(f"input has {x.ndim} dims but target_dims is {target_dims}, which is less")
+        return x[(...,) + (None,) * dims_to_append]
+
+    def masking(self, x, index):
+        """Mask to keep only the specified index frame, zero out all others.
+        x shape: (b, c, t, h, w) for AnimateDiff
+        """
+        mask = torch.zeros_like(x)
+        mask[:, :, index, :, :] = 1
+        return x * mask
+
+    def CG(self, A, b, x, n_inner=5, eps=1e-5):
+        """Conjugate Gradient solver for data consistency.
+        For AnimateDiff: x shape is (b, c, t, h, w)
+        """
+        r = b - A(x)
+        p = r.clone()
+        # Sum over all dimensions except batch (if needed)
+        rsold = torch.sum(r * r, dim=[1, 2, 3, 4], keepdim=True)
+        for i in range(n_inner):
+            Ap = A(p)
+            a = rsold / (torch.sum(p * Ap, dim=[1, 2, 3, 4], keepdim=True) + 1e-10)
+            x = x + a * p
+            r = r - a * Ap
+            rsnew = torch.sum(r * r, dim=[1, 2, 3, 4], keepdim=True)
+            if torch.abs(torch.sqrt(rsnew)).max() < eps:
+                break
+            p = r + (rsnew / rsold) * p
+            rsold = rsnew
+        return x
+
+    def DDS(self, x, n_inner, latent, frame_index=-1):
+        """Data consistency step to enforce latent at specified frame.
+        x shape: (b, c, t, h, w)
+        latent shape: (b, c, h, w)
+        """
+        measurement = torch.zeros_like(x)
+        measurement[:, :, frame_index, :, :] = latent
+        A = lambda z: self.masking(z, frame_index)
+        AT = lambda z: self.masking(z, frame_index)
+        Acg_fn = lambda z: AT(A(z))
+        bcg = AT(measurement)
+        return self.CG(Acg_fn, bcg, x, n_inner=n_inner)
+
     @torch.no_grad()
     def __call__(
         self,
@@ -338,6 +386,13 @@ class AnimationPipeline(DiffusionPipeline):
         controlnet_images: torch.FloatTensor = None,
         controlnet_image_index: list = [0],
         controlnet_conditioning_scale: Union[float, List[float]] = 1.0,
+
+        # VIBID parameters
+        enable_vibid: bool = False,
+        input_start_image: Optional[torch.FloatTensor] = None,
+        input_end_image: Optional[torch.FloatTensor] = None,
+        cfg_scale_flip: float = 1.0,
+        n_inner: int = 5,
 
         **kwargs,
     ):
@@ -392,59 +447,92 @@ class AnimationPipeline(DiffusionPipeline):
         # Prepare extra step kwargs.
         extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
 
-        # Denoising loop
+        # Encode start and end images for VIBID if provided
+        latent_end = None
+        latent_start = None
+        if enable_vibid:
+                if input_start_image is not None:
+                    # Encode start image to latent space
+                    latent_start = self.vae.encode(input_start_image.to(device).to(latents_dtype)).latent_dist.sample()
+                    latent_start = latent_start * 0.18215
+                else:
+                    raise ValueError("VIBID mode requires input_start_image to be provided")
+            
+                if input_end_image is not None:
+                    # Encode end image to latent space
+                    latent_end = self.vae.encode(input_end_image.to(device).to(latents_dtype)).latent_dist.sample()
+                    latent_end = latent_end * 0.18215
+                else:
+                    raise ValueError("VIBID mode requires input_end_image to be provided")
+            
+                # Initialize first and last frames with encoded images (NOT pure noise)
+                # This is critical for VIBID to work properly
+                # Add noise to make them consistent with other frames at t=T
+                latents[:, :, 0:1, :, :] = latent_start.unsqueeze(2) * self.scheduler.init_noise_sigma
+                latents[:, :, -1:, :, :] = latent_end.unsqueeze(2) * self.scheduler.init_noise_sigma
+                print(f"VIBID: Initialized first and last frames with noised images for consistency")
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
-                # expand the latents if we are doing classifier free guidance
-                latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
-                latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
-
-                down_block_additional_residuals = mid_block_additional_residual = None
-                if (getattr(self, "controlnet", None) != None) and (controlnet_images != None):
-                    assert controlnet_images.dim() == 5
-
-                    controlnet_noisy_latents = latent_model_input
-                    controlnet_prompt_embeds = text_embeddings
-
-                    controlnet_images = controlnet_images.to(latents.device)
-
-                    controlnet_cond_shape    = list(controlnet_images.shape)
-                    controlnet_cond_shape[2] = video_length
-                    controlnet_cond = torch.zeros(controlnet_cond_shape).to(latents.device)
-
-                    controlnet_conditioning_mask_shape    = list(controlnet_cond.shape)
-                    controlnet_conditioning_mask_shape[1] = 1
-                    controlnet_conditioning_mask          = torch.zeros(controlnet_conditioning_mask_shape).to(latents.device)
-
-                    assert controlnet_images.shape[2] >= len(controlnet_image_index)
-                    controlnet_cond[:,:,controlnet_image_index] = controlnet_images[:,:,:len(controlnet_image_index)]
-                    controlnet_conditioning_mask[:,:,controlnet_image_index] = 1
-
-                    down_block_additional_residuals, mid_block_additional_residual = self.controlnet(
-                        controlnet_noisy_latents, t,
-                        encoder_hidden_states=controlnet_prompt_embeds,
-                        controlnet_cond=controlnet_cond,
-                        conditioning_mask=controlnet_conditioning_mask,
-                        conditioning_scale=controlnet_conditioning_scale,
-                        guess_mode=False, return_dict=False,
+                if enable_vibid and latent_end is not None:
+                    # VIBID bidirectional denoising
+                    latents = self._vibid_step(
+                        latents, latent_end, latent_start, t, timesteps, i,
+                        text_embeddings, do_classifier_free_guidance,
+                        guidance_scale, cfg_scale_flip, n_inner,
+                        latents_dtype, video_length, extra_step_kwargs
                     )
+                else:
+                    # Standard denoising
+                    # expand the latents if we are doing classifier free guidance
+                    latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
+                    latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
 
-                # predict the noise residual
-                noise_pred = self.unet(
-                    latent_model_input, t, 
-                    encoder_hidden_states=text_embeddings,
-                    down_block_additional_residuals = down_block_additional_residuals,
-                    mid_block_additional_residual   = mid_block_additional_residual,
-                ).sample.to(dtype=latents_dtype)
+                    down_block_additional_residuals = mid_block_additional_residual = None
+                    if (getattr(self, "controlnet", None) != None) and (controlnet_images != None):
+                        assert controlnet_images.dim() == 5
 
-                # perform guidance
-                if do_classifier_free_guidance:
-                    noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-                    noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+                        controlnet_noisy_latents = latent_model_input
+                        controlnet_prompt_embeds = text_embeddings
 
-                # compute the previous noisy sample x_t -> x_t-1
-                latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs).prev_sample
+                        controlnet_images = controlnet_images.to(latents.device)
+
+                        controlnet_cond_shape    = list(controlnet_images.shape)
+                        controlnet_cond_shape[2] = video_length
+                        controlnet_cond = torch.zeros(controlnet_cond_shape).to(latents.device)
+
+                        controlnet_conditioning_mask_shape    = list(controlnet_cond.shape)
+                        controlnet_conditioning_mask_shape[1] = 1
+                        controlnet_conditioning_mask          = torch.zeros(controlnet_conditioning_mask_shape).to(latents.device)
+
+                        assert controlnet_images.shape[2] >= len(controlnet_image_index)
+                        controlnet_cond[:,:,controlnet_image_index] = controlnet_images[:,:,:len(controlnet_image_index)]
+                        controlnet_conditioning_mask[:,:,controlnet_image_index] = 1
+
+                        down_block_additional_residuals, mid_block_additional_residual = self.controlnet(
+                            controlnet_noisy_latents, t,
+                            encoder_hidden_states=controlnet_prompt_embeds,
+                            controlnet_cond=controlnet_cond,
+                            conditioning_mask=controlnet_conditioning_mask,
+                            conditioning_scale=controlnet_conditioning_scale,
+                            guess_mode=False, return_dict=False,
+                        )
+
+                    # predict the noise residual
+                    noise_pred = self.unet(
+                        latent_model_input, t, 
+                        encoder_hidden_states=text_embeddings,
+                        down_block_additional_residuals = down_block_additional_residuals,
+                        mid_block_additional_residual   = mid_block_additional_residual,
+                    ).sample.to(dtype=latents_dtype)
+
+                    # perform guidance
+                    if do_classifier_free_guidance:
+                        noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                        noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+
+                    # compute the previous noisy sample x_t -> x_t-1
+                    latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs).prev_sample
 
                 # call the callback, if provided
                 if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
@@ -463,3 +551,73 @@ class AnimationPipeline(DiffusionPipeline):
             return video
 
         return AnimationPipelineOutput(videos=video)
+
+    def _vibid_step(
+        self,
+        latents,
+        latent_end,
+        latent_start,
+        t,
+        timesteps,
+        step_idx,
+        text_embeddings,
+        do_classifier_free_guidance,
+        guidance_scale,
+        cfg_scale_flip,
+        n_inner,
+        latents_dtype,
+        video_length,
+        extra_step_kwargs,
+    ):
+        """Perform one VIBID bidirectional denoising step."""
+        device = latents.device
+
+        # Current and next sigma
+        sigma = t
+        next_sigma = timesteps[step_idx + 1] if step_idx < len(timesteps) - 1 else None
+
+        # --- Forward pass (start -> end) ---
+        latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
+        latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
+
+        noise_pred = self.unet(
+            latent_model_input, t,
+            encoder_hidden_states=text_embeddings,
+        ).sample.to(dtype=latents_dtype)
+
+        if do_classifier_free_guidance:
+            noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+            noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+
+        # Scheduler forward step
+        latents_forward = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs, return_dict=False)[0]
+
+        # Enforce end frame
+        if latent_end is not None:
+            latents_forward = self.DDS(latents_forward, n_inner=n_inner, latent=latent_end.squeeze(2) if latent_end.dim() == 5 else latent_end, frame_index=-1)
+
+        # --- Backward pass (end -> start) ---
+        latents_bw = torch.flip(latents_forward, dims=[2])
+
+        latent_model_input = torch.cat([latents_bw] * 2) if do_classifier_free_guidance else latents_bw
+        latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
+
+        noise_pred_back = self.unet(
+            latent_model_input, t,
+            encoder_hidden_states=text_embeddings,
+        ).sample.to(dtype=latents_dtype)
+
+        if do_classifier_free_guidance:
+            noise_pred_uncond_back, noise_pred_text_back = noise_pred_back.chunk(2)
+            noise_pred_back = noise_pred_uncond_back + cfg_scale_flip * (noise_pred_text_back - noise_pred_uncond_back)
+
+        latents_back = self.scheduler.step(noise_pred_back, t, latents_bw, **extra_step_kwargs, return_dict=False)[0]
+
+        # Enforce start frame (now at index -1 due to flip)
+        if latent_start is not None:
+            latents_back = self.DDS(latents_back, n_inner=n_inner, latent=latent_start.squeeze(2) if latent_start.dim() == 5 else latent_start, frame_index=-1)
+
+        # Flip back to original order
+        latents_final = torch.flip(latents_back, dims=[2])
+
+        return latents_final
