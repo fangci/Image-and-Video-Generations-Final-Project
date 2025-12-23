@@ -1,0 +1,25 @@
+# 1-sketch-to-video
+- adapter_lora_scale: 1.0
+  adapter_lora_path: "models/Motion_Module/v3_sd15_adapter.ckpt"
+  dreambooth_path:    "models/DreamBooth_LoRA/realisticVisionV60B1_v51VAE.safetensors"
+
+  inference_config: "configs/inference/inference-v3_mask.yaml"
+  motion_module:    "models/Motion_Module/v3_sd15_mm.ckpt"
+
+  controlnet_config: "configs/inference/sparsectrl/image_condition.yaml"
+  controlnet_path:   "models/SparseCtrl/v3_sd15_sparsectrl_scribble.ckpt"
+
+  seed: -1
+  steps: 25
+  guidance_scale: 8.5
+
+  controlnet_image_indexs: [0]
+  controlnet_images:
+    - "__assets__/demos/scribble/castle_1.png"
+    - "__assets__/demos/scribble/castle_1_contour2.png"   # create your own contour image by using filter_test2.py
+
+  prompt:
+     - "A mysterious gothic castle, surrounded by a dark enchanted forest, dramatic volumetric lighting, vibrant blue and purple neon highlights on the trees, heavy mist and fog, high quality, cinematic render, unreal engine"
+     - "Fantasy painting of an abandoned medieval fortress on a moonlit night, overgrown twisted vines, glowing arcane symbols in the stonework, deep shadows, professional digital painting, atmospheric"
+  n_prompt:
+  - "worst quality, low quality, letterboxed, blurry, cropped, text, watermark, deformed, ugly, extra limbs, simple sketch, black and white, line art"
