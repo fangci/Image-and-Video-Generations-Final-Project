@@ -6,7 +6,7 @@ samples/
 __pycache__/
 ossutil_output/
 .ossutil_checkpoint/
-
+test/
 
 *.ipynb
 *.safetensors
