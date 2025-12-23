@@ -450,6 +450,7 @@ class AnimationPipeline(DiffusionPipeline):
                         controlnet_cond[:,:,controlnet_image_index] = controlnet_images[:,:,:len(controlnet_image_index)]
                         controlnet_conditioning_mask[:,:,controlnet_image_index] = 1
 
+                        controlnet_conditioning_scale = 1.0
                         if latents_mask is not None or cache_reference_eps:
                             def controlnet_scale_schedule(i, total_steps):
                                 progress = i / total_steps
